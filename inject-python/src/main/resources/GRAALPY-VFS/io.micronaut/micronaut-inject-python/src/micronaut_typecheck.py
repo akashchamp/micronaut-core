@@ -174,6 +174,7 @@ class TypeChecker:
         PythonDiagnostic values.
         """
         self.facts = TypeFacts(visitor_context)
+        self.python_classes = PythonClasses(self)
         for unit in self.units():
             if unit.severity is None or unit.node is None:
                 continue
@@ -497,6 +498,9 @@ class Typed:
             return "python:" + self.name
         if self.kind == JAVA:
             return self.name
+        if self.kind == PY:
+            # a Python class passes to Java as its generated class
+            return self.name.qualifiedName()
         return None
 
 
@@ -587,6 +591,9 @@ class Bindings:
             qualified = self.visitor.java_type_assignments.get(name) or self.visitor.imported_types.get(name) or name
         if "." not in qualified:
             return None
+        model = self.checker.python_classes.by_qualified.get(qualified)
+        if model is not None:
+            return Typed(PY if instance else PY_REF, model.class_def)
         description = self.facts.describe(qualified)
         if description is None:
             return None
@@ -595,8 +602,8 @@ class Bindings:
             # an annotation is bound to its generated decorator function, whose attributes are its own
             return None
         if description.pythonDefined():
-            # a Python class: its members are more than those of its generated class, so the Java rules
-            # do not apply to it
+            # a Python class of another compilation: its members are more than those of its generated
+            # class, so the Java rules do not apply to it
             return None
         return Typed(JAVA if instance else JAVA_REF, description.name())
 
@@ -791,6 +798,8 @@ class JavaReceiverRules:
             return Typed(JAVA_REF if name == "class_" else JAVA, "java.lang.Class") if name == "class_" and receiver.kind in (JAVA, JAVA_REF) else None
         if receiver.kind in (JAVA, JAVA_REF):
             return self._java_member(receiver, name, node, calling)
+        if receiver.kind in (PY, PY_REF):
+            return self._python_member(receiver, name, node, calling)
         if receiver.kind == BUILTIN:
             return None  # the methods of Python values are not checked
         return None
@@ -861,8 +870,7 @@ class JavaReceiverRules:
     def call(self, node):
         function = node.func
         argument_types = [self.expression(argument) for argument in node.args if not isinstance(argument, ast.Starred)]
-        for kw in node.keywords:
-            self.expression(kw.value)
+        keyword_types = [self.expression(kw.value) for kw in node.keywords]
         star_args = any(isinstance(argument, ast.Starred) for argument in node.args)
         kwargs = bool(node.keywords)
         if isinstance(function, ast.Attribute):
@@ -877,6 +885,8 @@ class JavaReceiverRules:
                 return None
             if receiver.kind in (JAVA, JAVA_REF):
                 return self._java_call(receiver, name, node, argument_types, star_args, kwargs)
+            if receiver.kind in (PY, PY_REF):
+                return self._python_call(receiver, name, node, argument_types, star_args, keyword_types)
             return None
         if isinstance(function, ast.Name):
             target = self.bindings.lookup(function.id)
@@ -885,7 +895,7 @@ class JavaReceiverRules:
             if target.kind == JAVA_REF:
                 return self._java_construction(target, node, argument_types, star_args, kwargs)
             if target.kind == PY_REF:
-                return Typed(PY, target.name)
+                return self._python_construction(target, node, argument_types, star_args, keyword_types)
             return None
         self.expression(function)
         return None
@@ -1023,3 +1033,502 @@ class JavaReceiverRules:
 
     def _report(self, rule, message, node, suggestions=()):
         self.checker.report(self.unit, rule, message, self.span_of(node), suggestions)
+
+
+# ---------------------------------------------------------------- Python receivers
+
+# Python bases that add no members of their own; any other base the checker cannot see makes a class open
+TRANSPARENT_BASES = {"object", "abc.ABC", "ABC", "typing.Protocol", "Protocol", "typing.Generic", "Generic", "Generic[...]"}
+
+
+def _self_attributes(class_node):
+    """The names assigned as self.<name> anywhere in the methods of a class."""
+    names = set()
+    for statement in getattr(class_node, "body", ()):
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.args.args:
+            receiver = statement.args.args[0].arg
+            for node in ast.walk(statement):
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        for element in (target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]):
+                            if isinstance(element, ast.Attribute) and isinstance(element.value, ast.Name) and element.value.id == receiver:
+                                names.add(element.attr)
+    return names
+
+
+class Signature:
+    """
+    The parameters of a Python function as its AST declares them. The receiver parameter is excluded
+    when the function is called bound: a method on an instance, a class method or a static method on
+    either; a plain method called on the class takes its receiver as the first argument.
+    """
+
+    def __init__(self, node, bound):
+        args = node.args
+        positional_only = list(getattr(args, "posonlyargs", []))
+        positional = positional_only + list(args.args)
+        self.receiver = None
+        if bound and positional and not any(_decorator_name(d) == "staticmethod" for d in node.decorator_list):
+            self.receiver = positional.pop(0).arg
+        self.positional = [argument.arg for argument in positional]
+        self.positional_only = max(0, len(positional_only) - (1 if self.receiver is not None else 0))
+        self.defaults = len(args.defaults)
+        self.vararg = args.vararg is not None
+        self.keyword_only = [argument.arg for argument in args.kwonlyargs]
+        self.keyword_required = {argument.arg for argument, default in zip(args.kwonlyargs, args.kw_defaults) if default is None}
+        self.kwarg = args.kwarg is not None
+        self.annotations = {argument.arg: argument.annotation for argument in positional + list(args.kwonlyargs)}
+
+    @classmethod
+    def of_model(cls, function_def):
+        """The signature of a function the model generated (a dataclass constructor), which has no AST node."""
+        signature = cls.__new__(cls)
+        arguments = list(function_def.arguments().arguments())
+        signature.receiver = "self"
+        signature.positional = [argument.name() for argument in arguments if not argument.variadic()]
+        signature.positional_only = 0
+        signature.defaults = sum(1 for argument in arguments if not argument.variadic() and argument.hasDefaultValue())
+        signature.vararg = any(argument.variadic() for argument in arguments)
+        signature.keyword_only = []
+        signature.keyword_required = set()
+        signature.kwarg = False
+        signature.annotations = {}
+        return signature
+
+    @property
+    def required(self):
+        return len(self.positional) - self.defaults
+
+    def accepts_keyword(self, name):
+        """Whether a keyword argument of the name reaches a parameter of the name (not a positional-only one)."""
+        return name in self.positional[self.positional_only:] or name in self.keyword_only
+
+    def render(self):
+        parts = list(self.positional)
+        if self.positional_only:
+            parts.insert(self.positional_only, "/")
+        if self.vararg:
+            parts.append("*args")
+        elif self.keyword_only:
+            parts.append("*")
+        parts.extend(self.keyword_only)
+        if self.kwarg:
+            parts.append("**kwargs")
+        return ", ".join(parts)
+
+
+def _bound_on_class(node):
+    """Whether a method called on its class is bound (a class method or a static method takes no explicit receiver)."""
+    return any(_decorator_name(d) in ("staticmethod", "classmethod") for d in node.decorator_list)
+
+
+def _accessor_targets(name):
+    """The attribute names a Java-style accessor (getName, isName, setName) of a generated class reads or writes."""
+    for prefix in ("get", "is", "set"):
+        if name.startswith(prefix) and len(name) > len(prefix) and name[len(prefix)].isupper():
+            rest = name[len(prefix):]
+            camel = rest[0].lower() + rest[1:]
+            snake = "".join("_" + c.lower() if c.isupper() else c for c in rest).lstrip("_")
+            return {camel, snake}
+    return set()
+
+
+def _decorator_name(decorator):
+    if isinstance(decorator, ast.Name):
+        return decorator.id
+    if isinstance(decorator, ast.Attribute):
+        return decorator.attr
+    if isinstance(decorator, ast.Call):
+        return _decorator_name(decorator.func)
+    return None
+
+
+class PythonClassModel:
+    """
+    What the checker knows about a Python class of the compilation: its own members from the model
+    and the AST, and its bases. A class is open when it or a base can have members the checker
+    cannot see (a __getattr__, a base outside the compilation); nothing is reported on an open class.
+    """
+
+    def __init__(self, classes, class_def, node, module):
+        self.classes = classes
+        self.class_def = class_def
+        self.node = node
+        self.module = module
+        self.name = class_def.name().replace("$", ".")  # a nested class, as Python spells it
+        self.qualified = class_def.qualifiedName()
+        self.methods = {}
+        for function_def in class_def.functions():
+            self.methods[function_def.name()] = (function_def, _function_node(node, function_def.name()))
+        constructor = class_def.constructor()
+        self.constructor = (constructor, _function_node(node, "__init__")) if constructor is not None else None
+        self.properties = {prop.name(): prop for prop in class_def.properties()}
+        self.attributes = {attribute.name(): attribute for attribute in class_def.attributes()}
+        self.instance_attributes = _self_attributes(node)
+        self.nested = {child.name: child for child in getattr(node, "body", ()) if isinstance(child, ast.ClassDef)}
+        # a __getattr__ may add members; a __getattribute__ may replace even the declared ones; a
+        # metaclass or a decorator the checker does not know may install members of its own
+        self.dynamic = "__getattr__" in self.methods
+        self.lookup_dynamic = "__getattribute__" in self.methods
+        self.metaclass = any(kw.arg == "metaclass" for kw in getattr(node, "keywords", ()))
+        self._bases = None
+        self._subclasses = None
+
+    @property
+    def bases(self):
+        """The resolved bases: PythonClassModel, a Java TypeDescription, or None for an unknown base."""
+        if self._bases is None:
+            self._bases = []
+            for base in self.class_def.bases():
+                name = base.name()
+                if name in TRANSPARENT_BASES:
+                    continue
+                model = self.classes.by_qualified.get(name)
+                if model is not None:
+                    self._bases.append(model)
+                    continue
+                description = self.classes.checker.facts.describe(name) if "." in name else None
+                self._bases.append(description)
+        return self._bases
+
+    def is_lookup_dynamic(self, seen=None):
+        """Whether a __getattribute__ of the class or a base decides every lookup: nothing about a member is known."""
+        seen = seen or set()
+        if self.qualified in seen:
+            return False
+        seen.add(self.qualified)
+        return self.lookup_dynamic or any(isinstance(base, PythonClassModel) and base.is_lookup_dynamic(seen) for base in self.bases)
+
+    def is_open(self, seen=None):
+        seen = seen or set()
+        if self.qualified in seen:
+            return False
+        seen.add(self.qualified)
+        if self.dynamic or self.lookup_dynamic or self.metaclass or self._decorated_by_unknown():
+            return True
+        for base in self.bases:
+            if base is None:
+                return True
+            if isinstance(base, PythonClassModel) and base.is_open(seen):
+                return True
+        return False
+
+    def find(self, name, seen=None):
+        """
+        The member of the given name: ("method", function_def, node), ("constructor", ...),
+        ("property", property_def), ("attribute", attribute_def), ("instance", None) or
+        ("java", description) for a member of a Java base; None when the class has no such member.
+        """
+        seen = seen or set()
+        if self.qualified in seen:
+            return None
+        seen.add(self.qualified)
+        if self.is_lookup_dynamic():
+            return None  # a __getattribute__ may hand out anything for the name
+        if name in self.methods:
+            return ("method",) + self.methods[name]
+        if name == "__init__" and self.constructor is not None:
+            return ("constructor",) + self.constructor
+        if name in self.properties:
+            return ("property", self.properties[name])
+        if name in self.attributes:
+            return ("attribute", self.attributes[name])
+        if name in self.instance_attributes:
+            return ("instance", None)
+        if name in self.nested:
+            return ("class", self.nested[name])
+        if any(target in self.properties or target in self.attributes or target in self.instance_attributes for target in _accessor_targets(name)):
+            return ("accessor", None)  # the value may be the generated Java object, with accessors
+        for base in self.bases:
+            if isinstance(base, PythonClassModel):
+                found = base.find(name, seen)
+                if found is not None:
+                    return found
+            elif base is not None:
+                if base.methods().containsKey(name) or base.fields().containsKey(name) or base.nestedTypes().containsKey(name) or name in OBJECT_METHODS:
+                    return ("java", base)
+                if base.protectedMethods().contains(name):
+                    return ("inherited", None)  # a protected method of the Java base: not judged further
+        return None
+
+    def constructor_of(self, seen=None):
+        """
+        The __init__ a construction of the class calls, as (function_def, node): its own or the
+        nearest inherited one; None for the implicit no-argument constructor; UNKNOWN when the
+        arguments go somewhere the checker cannot see (a __new__, a base outside the compilation,
+        a Java base, or a decorator that may generate the constructor).
+        """
+        seen = seen or set()
+        if self.qualified in seen:
+            return None
+        seen.add(self.qualified)
+        if self.constructor is not None and not self.is_lookup_dynamic():
+            return self.constructor
+        if "__new__" in self.methods or self.is_open():
+            return UNKNOWN
+        for base in self.bases:
+            if isinstance(base, PythonClassModel):
+                found = base.constructor_of(seen)
+                if found is not None:
+                    return found
+            elif base is not None:
+                return UNKNOWN  # a Java base: its constructors take the arguments
+        return None
+
+    def _decorated_by_unknown(self):
+        """Whether a decorator of the class is neither a Java annotation nor dataclass: it may generate an __init__."""
+        facts = self.classes.checker.facts
+        for decorator in self.class_def.decorators():
+            name = decorator.annotationName()
+            if name.rsplit(".", 1)[-1] == "dataclass":
+                continue  # its constructor is in the model already
+            annotation = facts.describeAnnotation(name) if "." in name else None
+            if annotation is None or not annotation.annotation():
+                return True
+        return False
+
+    @property
+    def subclasses(self):
+        """The classes of the compilation extending this one: a value of the class may be any of them."""
+        if self._subclasses is None:
+            self._subclasses = [model for model in self.classes.all() if model is not self and model.is_subclass_of(self)]
+        return self._subclasses
+
+    def subclass_defines(self, name):
+        return any(subclass.find(name) is not None for subclass in self.subclasses)
+
+    def member_names(self, seen=None):
+        seen = seen or set()
+        if self.qualified in seen:
+            return []
+        seen.add(self.qualified)
+        names = list(self.methods) + list(self.properties) + list(self.attributes) + sorted(self.instance_attributes) + list(self.nested)
+        for base in self.bases:
+            if isinstance(base, PythonClassModel):
+                names.extend(base.member_names(seen))
+            elif base is not None:
+                names.extend(base.methods().keySet())
+                names.extend(base.fields().keySet())
+        return [name for name in names if not name.startswith("_")]
+
+    def is_subclass_of(self, other, seen=None):
+        if self is other:
+            return True
+        seen = seen or set()
+        if self.qualified in seen:
+            return False
+        seen.add(self.qualified)
+        return any(isinstance(base, PythonClassModel) and base.is_subclass_of(other, seen) for base in self.bases)
+
+    def instance_attribute_type(self, name, bindings):
+        """The type of self.<name> when __init__ assigns it a hinted parameter directly, else None."""
+        if self.constructor is None or self.constructor[1] is None:
+            return None
+        function_def, node = self.constructor
+        hints = {argument.name(): argument.typeAnnotation() for argument in function_def.arguments().arguments()}
+        for statement in node.body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target = statement.targets[0]
+                if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"
+                        and target.attr == name and isinstance(statement.value, ast.Name)):
+                    hint = hints.get(statement.value.id)
+                    return bindings.of_hint(hint) if hint is not None else None
+        return None
+
+
+# the constructor of a class whose arguments the checker cannot follow
+UNKNOWN = object()
+
+
+class PythonClasses:
+    """The Python classes of the compilation, by qualified name and by ClassDef."""
+
+    def __init__(self, checker):
+        self.checker = checker
+        self.by_qualified = {}
+        self.by_def = {}
+        self.by_node = {}
+        self.models = []
+        for module in checker._modules.values():
+            for class_def, node in module.classes:
+                model = PythonClassModel(self, class_def, node, module)
+                self.models.append(model)
+                self.by_qualified[model.qualified] = model
+                self.by_def[id(class_def)] = model
+                self.by_node[id(node)] = model
+                # a class of the root package is also known by its bare name
+                self.by_qualified.setdefault(model.name, model)
+
+    def all(self):
+        return self.models
+
+    def of(self, class_def):
+        model = self.by_def.get(id(class_def))
+        if model is None:
+            model = self.by_qualified.get(class_def.qualifiedName())
+        return model
+
+
+class PythonReceiverMixin:
+    """The checks of calls, attribute reads and constructions whose receiver is a Python class of the compilation."""
+
+    def _python_model(self, receiver):
+        return self.checker.python_classes.of(receiver.name)
+
+    def _python_member(self, receiver, name, node, calling):
+        model = self._python_model(receiver)
+        if model is None:
+            return None
+        found = model.find(name)
+        if found is None:
+            if not model.is_open() and not name.startswith("_") and not model.subclass_defines(name):
+                suggestions = suggest(name, model.member_names())
+                self._report("unknown-python-member",
+                             f"class [{model.name}] has no member [{name}]{_did_you_mean(suggestions)}",
+                             node, suggestions)
+            return None
+        kind = found[0]
+        if kind in ("method", "constructor", "accessor", "inherited"):
+            return Typed(CALLABLE, name) if not calling else None
+        if kind == "class":
+            nested = self.checker.python_classes.by_node.get(id(found[1]))
+            return Typed(PY_REF, nested.class_def) if nested is not None else None
+        if kind == "property":
+            getter = found[1].getter()
+            return self._hinted_return(getter) if getter is not None else None
+        if kind == "attribute":
+            return self.bindings.of_hint(found[1].typeName())
+        if kind == "instance":
+            return model.instance_attribute_type(name, self.bindings)
+        if kind == "java":
+            description = found[1]
+            return self._java_member(Typed(JAVA if receiver.kind == PY else JAVA_REF, description.name()), name, node, calling)
+        return None
+
+    def _hinted_return(self, function_def):
+        return_def = function_def.returnType()
+        type_ref = return_def.typeAnnotation() if return_def is not None else None
+        return self.bindings.of_hint(type_ref) if type_ref is not None else None
+
+    def _python_call(self, receiver, name, node, argument_types, star_args, keyword_types):
+        model = self._python_model(receiver)
+        if model is None:
+            return None
+        found = model.find(name)
+        if found is None:
+            self._python_member(receiver, name, node, calling=True)
+            return None
+        if found[0] == "java":
+            return self._java_call(Typed(JAVA if receiver.kind == PY else JAVA_REF, found[1].name()), name, node, argument_types, star_args, bool(node.keywords))
+        if found[0] == "class":
+            nested = self.checker.python_classes.by_node.get(id(found[1]))
+            return self._python_construction(Typed(PY_REF, nested.class_def), node, argument_types, star_args, keyword_types) if nested is not None else None
+        if found[0] not in ("method", "constructor"):
+            return None  # calling a property's, an attribute's or an accessor's value: not judged
+        function_def, function_node = found[1], found[2]
+        if function_node is not None and not star_args:
+            # on an instance every method is bound; on the class only a class or static method is
+            bound = receiver.kind == PY or _bound_on_class(function_node)
+            self._check_python_arguments(model, function_def, Signature(function_node, bound), node, argument_types, keyword_types)
+        return self._hinted_return(function_def)
+
+    def _python_construction(self, target, node, argument_types, star_args, keyword_types):
+        model = self._python_model(target)
+        if model is None or star_args:
+            return Typed(PY, target.name)
+        constructor = model.constructor_of()
+        if constructor is None:
+            arguments = len(argument_types) + len(node.keywords)
+            if arguments and not any(kw.arg is None for kw in node.keywords):
+                self._report("python-arity", f"[{model.name}] takes no arguments; got {arguments}", node)
+        elif constructor is not UNKNOWN:
+            function_def, function_node = constructor
+            signature = Signature(function_node, True) if function_node is not None else Signature.of_model(function_def)
+            self._check_python_arguments(model, function_def, signature, node, argument_types, keyword_types)
+        return Typed(PY, target.name)
+
+    def _check_python_arguments(self, model, function_def, signature, call, argument_types, keyword_types):
+        label = f"{model.name}.{function_def.name()}"
+        positional = len(argument_types)
+        keywords = [(kw, typed) for kw, typed in zip(call.keywords, keyword_types) if kw.arg is not None]
+        if any(kw.arg is None for kw in call.keywords):
+            return  # **expansion: the argument layout is unknown
+        if positional > len(signature.positional) and not signature.vararg:
+            self._report("python-arity",
+                         f"[{label}] takes {len(signature.positional)} positional arguments ({signature.render()}); got {positional}",
+                         call.args[len(signature.positional)] if len(call.args) > len(signature.positional) else call)
+            return
+        provided = set(signature.positional[:positional])
+        for kw, _ in keywords:
+            if signature.accepts_keyword(kw.arg):
+                if kw.arg in provided:
+                    self._report("python-arity", f"[{label}] got multiple values for parameter [{kw.arg}]", kw)
+                provided.add(kw.arg)
+            elif signature.kwarg:
+                continue  # collected by **kwargs, whatever its name
+            elif kw.arg in signature.positional:
+                self._report("python-arity", f"[{label}] parameter [{kw.arg}] is positional-only ({signature.render()})", kw)
+                provided.add(kw.arg)  # reported once: not missing as well
+            else:
+                suggestions = suggest(kw.arg, signature.positional[signature.positional_only:] + signature.keyword_only)
+                self._report("python-arity", f"[{label}] has no parameter [{kw.arg}]{_did_you_mean(suggestions)}", kw, suggestions)
+        missing = [name for name in signature.positional[:signature.required] if name not in provided]
+        missing += [name for name in signature.keyword_only if name in signature.keyword_required and name not in provided]
+        if missing:
+            self._report("python-arity", f"[{label}] is missing the arguments [{', '.join(missing)}]", call)
+        # the argument types the checker knows against the hinted parameters
+        hints = {argument.name(): argument.typeAnnotation() for argument in function_def.arguments().arguments()}
+        for index, argument in enumerate(argument_types[:len(signature.positional)]):
+            self._check_python_argument(label, signature.positional[index], hints, signature, argument, call.args[index])
+        for kw, typed in keywords:
+            if signature.accepts_keyword(kw.arg):
+                self._check_python_argument(label, kw.arg, hints, signature, typed, kw.value)
+
+    def _parameter_type(self, parameter, hints, signature):
+        """The type a parameter's hint denotes: from the model, or from the AST for a keyword-only parameter the model omits."""
+        hint = hints.get(parameter)
+        if hint is not None:
+            return self.bindings.of_hint(hint)
+        annotation = signature.annotations.get(parameter)
+        return self._hint_type(annotation) if annotation is not None else None
+
+    def _check_python_argument(self, label, parameter, hints, signature, argument, node):
+        if argument is None:
+            return
+        expected = self._parameter_type(parameter, hints, signature)
+        if expected is None:
+            return
+        if not self._fits(argument, expected):
+            self._report("argument-type",
+                         f"argument [{parameter}] of [{label}] expects [{self._describe(expected)}]; got {self._describe(argument)}",
+                         node)
+
+    def _fits(self, argument, expected):
+        if expected.kind == BUILTIN:
+            if argument.kind == BUILTIN:
+                return argument.name == expected.name or (argument.name == "int" and expected.name == "float") or argument.name == "none" or expected.name in ("list", "tuple") and argument.name in ("list", "tuple")
+            if argument.kind == JAVA:
+                converted = BUILTIN_JAVA_TYPES.get(argument.name)
+                return converted is None or converted == expected.name or (converted == "int" and expected.name == "float")
+            return True
+        if expected.kind == JAVA:
+            source = argument.java_name()
+            return source is None or self.facts.isAssignable(source, expected.name)
+        if expected.kind == PY:
+            if argument.kind == PY:
+                mine = self.checker.python_classes.of(argument.name)
+                theirs = self.checker.python_classes.of(expected.name)
+                return mine is None or theirs is None or mine.is_subclass_of(theirs)
+            return argument.kind != BUILTIN or argument.name == "none"
+        return True
+
+    @staticmethod
+    def _describe(typed):
+        return typed.label()
+
+
+# the Python receiver checks join the rules of the function bodies
+for _name, _member in list(vars(PythonReceiverMixin).items()):
+    if not _name.startswith("__"):
+        setattr(JavaReceiverRules, _name, _member)
