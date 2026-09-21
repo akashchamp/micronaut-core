@@ -1,6 +1,8 @@
 package io.micronaut.http.filter
 
 import org.jspecify.annotations.Nullable
+import io.micronaut.core.annotation.AnnotationMetadata
+import io.micronaut.core.annotation.AnnotationUtil
 import io.micronaut.core.convert.ConversionService
 import io.micronaut.core.execution.CompletableFutureExecutionFlow
 import io.micronaut.core.execution.ExecutionFlow
@@ -12,6 +14,7 @@ import io.micronaut.http.HttpResponse
 import io.micronaut.http.HttpStatus
 import io.micronaut.http.MutableHttpResponse
 import io.micronaut.http.bind.DefaultRequestBinderRegistry
+import io.micronaut.inject.annotation.MutableAnnotationMetadata
 import io.micronaut.http.reactive.execution.ReactiveExecutionFlow
 import org.reactivestreams.Publisher
 import reactor.core.publisher.Flux
@@ -20,6 +23,8 @@ import spock.lang.Specification
 
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import java.util.function.Supplier
 
 class FilterRunnerSpec extends Specification {
@@ -599,12 +604,425 @@ class FilterRunnerSpec extends Specification {
         events == ["before", "terminal", "after"]
     }
 
+    def 'before returns execution flow request'() {
+        given:
+        def events = []
+        def req1 = HttpRequest.GET("/req1")
+        def req2 = HttpRequest.GET("/req2")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest))) { req ->
+                    assert req == req1
+                    events.add("before")
+                    ExecutionFlow.just(req2)
+                }
+        ]
+
+        when:
+        def result = filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(req1).tryComplete()
+        then:
+        result != null
+        result.value.status() == HttpStatus.OK
+        events == ["before", "terminal"]
+    }
+
+    def 'before returns delayed execution flow request'() {
+        given:
+        def events = []
+        def req1 = HttpRequest.GET("/req1")
+        def req2 = HttpRequest.GET("/req2")
+        def future = new CompletableFuture<HttpRequest<?>>()
+        HttpRequest<?> terminalRequest = null
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest))) { req ->
+                    events.add("before")
+                    CompletableFutureExecutionFlow.just(future)
+                }
+        ]
+        def runner = new FilterRunner(filters, (filteredRequest, propagatedContext) -> {
+            terminalRequest = filteredRequest
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        })
+
+        when:
+        def flow = runner.run(req1)
+        then:
+        events == ["before"]
+
+        when:
+        future.complete(req2)
+        await(flow)
+        then:
+        events == ["before", "terminal"]
+        terminalRequest == req2
+    }
+
+    def 'before returns execution flow response'() {
+        given:
+        def events = []
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse))) {
+                    events.add("before")
+                    ExecutionFlow.just(HttpResponse.accepted())
+                }
+        ]
+
+        when:
+        def resp = await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        resp.status() == HttpStatus.ACCEPTED
+        events == ["before"]
+    }
+
+    def 'before returns execution flow error'() {
+        given:
+        def testExc = new RuntimeException("Test exception")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest))) {
+                    ExecutionFlow.error(testExc)
+                }
+        ]
+
+        when:
+        await(filterRunner(filters, {
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/")))
+        then:
+        def e = thrown RuntimeException
+        e == testExc
+    }
+
+    def 'after returns execution flow response'() {
+        given:
+        def events = []
+        def resp1 = HttpResponse.ok("resp1")
+        def resp2 = HttpResponse.ok("resp2")
+        List<GenericHttpFilter> filters = [
+                after(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse))) { HttpResponse<?> resp ->
+                    assert resp == resp1
+                    events.add("after")
+                    ExecutionFlow.just(resp2)
+                }
+        ]
+
+        when:
+        def resp = await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        resp == resp2
+        events == ["terminal", "after"]
+    }
+
+    def 'around filter with execution flow continuation'(boolean delayed) {
+        given:
+        def events = []
+        def req1 = HttpRequest.GET("/req1")
+        def req2 = HttpRequest.GET("/req2")
+        def resp1 = HttpResponse.ok("resp1")
+        def resp2 = HttpResponse.ok("resp2")
+        HttpRequest<?> terminalRequest = null
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)]) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    assert request == req1
+                    events.add("before")
+                    continuation.request(req2).proceed().map { resp ->
+                        assert resp == resp1
+                        events.add("after")
+                        resp2
+                    }
+                }
+        ]
+        def runner = new FilterRunner(filters, (filteredRequest, propagatedContext) -> {
+            terminalRequest = filteredRequest
+            events.add("terminal")
+            delayed ? CompletableFutureExecutionFlow.just(CompletableFuture.supplyAsync { resp1 }) : ExecutionFlow.just(resp1)
+        })
+
+        when:
+        def result = await(runner.run(req1)).value
+        then:
+        result == resp2
+        terminalRequest == req2
+        events == ["before", "terminal", "after"]
+
+        where:
+        delayed << [false, true]
+    }
+
+    def 'execution flow continuation completes imperatively'() {
+        given:
+        def resp1 = HttpResponse.ok("resp1")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)]) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    continuation.proceed()
+                }
+        ]
+
+        when:
+        def result = filterRunner(filters, {
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/")).tryComplete()
+        then:
+        result != null
+        result.value == resp1
+    }
+
+    def 'execution flow continuation with other return types'(ReturnType returnType, Closure<?> convert) {
+        given:
+        def events = []
+        def resp1 = HttpResponse.ok("resp1")
+        List<GenericHttpFilter> filters = [
+                before(returnType, [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)]) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    events.add("before")
+                    convert(continuation.proceed())
+                }
+        ]
+
+        when:
+        def result = await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        result == resp1
+        events == ["before", "terminal"]
+
+        where:
+        returnType                                                     | convert
+        ReturnType.of(Publisher, Argument.of(HttpResponse))            | { ExecutionFlow flow -> ReactiveExecutionFlow.fromFlow(flow).toPublisher() }
+        ReturnType.of(CompletableFuture, Argument.of(HttpResponse))    | { ExecutionFlow flow -> flow.toCompletableFuture() }
+        ReturnType.of(HttpResponse)                                    | { ExecutionFlow flow -> flow.toCompletableFuture().get() }
+    }
+
+    def 'execution flow continuation handles downstream error'() {
+        given:
+        def testExc = new RuntimeException("Test exception")
+        def resp2 = HttpResponse.ok("resp2")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)]) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    continuation.proceed().onErrorResume { e ->
+                        assert e == testExc
+                        ExecutionFlow.just(resp2)
+                    }
+                }
+        ]
+
+        when:
+        def result = await(filterRunner(filters, {
+            ExecutionFlow.error(testExc)
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        result == resp2
+    }
+
+    def 'execution flow continuation propagates the reactor context'(boolean legacy) {
+        given:
+        def events = []
+        List<GenericHttpFilter> filters = [
+                around(legacy) { request, chain ->
+                    return Flux.deferContextual { ctx ->
+                        events.add('context 1: ' + ctx.get('value'))
+                        Flux.from(chain.proceed(request))
+                                .contextWrite { it.put('value', 'around 1') }
+                    }
+                },
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)]) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    events.add('flow')
+                    continuation.proceed()
+                },
+                around(legacy) { request, chain ->
+                    return Flux.deferContextual { ctx ->
+                        events.add('context 2: ' + ctx.get('value'))
+                        Flux.from(chain.proceed(request))
+                                .contextWrite { it.put('value', 'around 2') }
+                    }
+                },
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)]) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    continuation.proceed().putInContext('value', 'flow 2')
+                },
+        ]
+
+        when:
+        def runner = filterRunner(filters, {
+            return ReactiveExecutionFlow.fromPublisher(Mono.deferContextual(ctx -> {
+                events.add('terminal: ' + ctx.get('value'))
+                Mono.just(HttpResponse.ok("resp1"))
+            }))
+        })
+        def result = await(
+                ReactiveExecutionFlow.fromFlow(
+                        runner.run(HttpRequest.GET("/req1"))
+                ).putInContext('value', 'outer')
+        )
+        then:
+        result != null
+        events == ["context 1: outer", "flow", "context 2: around 1", "terminal: flow 2"]
+
+        where:
+        legacy << [false, true]
+    }
+
+    def 'async only execution flow filters do not touch reactive code'() {
+        given:
+        def executor = Executors.newSingleThreadExecutor()
+        def events = []
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)], executor) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    assertNotReactive()
+                    events.add("around")
+                    continuation.proceed()
+                },
+                before(ReturnType.of(CompletableFuture, Argument.of(HttpRequest))) { req ->
+                    assertNotReactive()
+                    events.add("async")
+                    CompletableFuture.supplyAsync({ req }, executor)
+                },
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest)), [Argument.of(HttpRequest<?>)], executor) { req ->
+                    assertNotReactive()
+                    events.add("flow")
+                    ExecutionFlow.just(req)
+                },
+                after(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse))) { HttpResponse<?> resp ->
+                    assertNotReactive()
+                    events.add("after")
+                    CompletableFutureExecutionFlow.just(CompletableFuture.supplyAsync({ resp }, executor))
+                },
+        ]
+
+        when:
+        def flow = filterRunner(filters, {
+            assertNotReactive()
+            events.add("terminal")
+            CompletableFutureExecutionFlow.just(CompletableFuture.supplyAsync({ HttpResponse.ok() }, executor))
+        }).run(HttpRequest.GET("/"))
+        def result = await(flow).value
+        then:
+        !(flow instanceof ReactiveExecutionFlow)
+        result.status() == HttpStatus.OK
+        events == ["around", "async", "flow", "terminal", "after"]
+
+        cleanup:
+        executor.shutdown()
+    }
+
+    def 'reactor context passes execution flow filters running on an executor'(boolean legacy) {
+        given:
+        def executor = Executors.newSingleThreadExecutor()
+        def events = []
+        List<GenericHttpFilter> filters = [
+                around(legacy) { request, chain ->
+                    Flux.from(chain.proceed(request)).contextWrite { it.put('value', 'around') }
+                },
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(HttpRequest<?>), Argument.of(FilterContinuation, ExecutionFlow)], executor) { request, FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    events.add("around flow")
+                    continuation.proceed()
+                },
+                before(ReturnType.of(CompletableFuture, Argument.of(HttpRequest))) { req ->
+                    events.add("async")
+                    CompletableFuture.supplyAsync({ req }, executor)
+                },
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest)), [Argument.of(HttpRequest<?>)], executor) { req ->
+                    events.add("flow")
+                    ExecutionFlow.just(req)
+                },
+        ]
+
+        when:
+        def result = await(filterRunner(filters, {
+            ReactiveExecutionFlow.fromPublisher(Mono.deferContextual(ctx -> {
+                events.add('terminal: ' + ctx.getOrDefault('value', 'missing'))
+                Mono.just(HttpResponse.ok())
+            }))
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        result.status() == HttpStatus.OK
+        events == ["around flow", "async", "flow", "terminal: around"]
+
+        cleanup:
+        executor.shutdown()
+
+        where:
+        legacy << [false, true]
+    }
+
+    def 'before returns a nullable response that completes later'(Class<?> type, Closure<?> result) {
+        given:
+        def events = []
+        def future = new CompletableFuture<HttpResponse<?>>()
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(type, nullableArgument(HttpResponse))) { req ->
+                    events.add("before")
+                    result(future)
+                }
+        ]
+
+        when:
+        def flow = filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/"))
+        future.complete(null)
+        def resp = await(flow).value
+        then:
+        resp.status() == HttpStatus.OK
+        events == ["before", "terminal"]
+
+        where:
+        type              | result
+        CompletableFuture | { CompletableFuture f -> f }
+        ExecutionFlow     | { CompletableFuture f -> CompletableFutureExecutionFlow.just(f) }
+        ExecutionFlow     | { CompletableFuture f -> ReactiveExecutionFlow.fromPublisher(Mono.fromFuture(f)) }
+    }
+
+    def 'before returns a non-nullable request that completes later with null'() {
+        given:
+        def future = new CompletableFuture<HttpRequest<?>>()
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest))) { req ->
+                    CompletableFutureExecutionFlow.just(future)
+                }
+        ]
+
+        when:
+        def flow = filterRunner(filters, {
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/"))
+        future.complete(null)
+        await(flow)
+        then:
+        def e = thrown NullPointerException
+        e.message == "Returned request must not be null, or mark the method as @Nullable"
+    }
+
+    private static Argument<?> nullableArgument(Class<?> type) {
+        def metadata = new MutableAnnotationMetadata()
+        metadata.addDeclaredAnnotation(AnnotationUtil.NULLABLE, [:])
+        return Argument.of(type, (AnnotationMetadata) metadata, new Argument[0])
+    }
+
+    private static void assertNotReactive() {
+        def reactorFrames = new Throwable().stackTrace.findAll { it.className.startsWith('reactor.') }
+        assert reactorFrames.isEmpty()
+    }
+
     private def after(ReturnType returnType, List<Argument> arguments = closure.parameterTypes.collect { Argument.of(it) }, Closure<?> closure) {
         return MethodFilter.prepareFilterMethod(ConversionService.SHARED, null, new LambdaExecutable(closure, arguments.toArray(new Argument[0]), returnType), true, new FilterOrder.Fixed(0), new DefaultRequestBinderRegistry(ConversionService.SHARED), null)
     }
 
     private def before(ReturnType returnType, List<Argument> arguments = closure.parameterTypes.collect { Argument.of(it) }, Closure<?> closure) {
-        return MethodFilter.prepareFilterMethod(ConversionService.SHARED, null, new LambdaExecutable(closure, arguments.toArray(new Argument[0]), returnType), false, new FilterOrder.Fixed(0), new DefaultRequestBinderRegistry(ConversionService.SHARED), null)
+        return before(returnType, arguments, null, closure)
+    }
+
+    private def before(ReturnType returnType, List<Argument> arguments, @Nullable Executor executor, Closure<?> closure) {
+        return MethodFilter.prepareFilterMethod(ConversionService.SHARED, null, new LambdaExecutable(closure, arguments.toArray(new Argument[0]), returnType), false, new FilterOrder.Fixed(0), new DefaultRequestBinderRegistry(ConversionService.SHARED), executor)
     }
 
     private def around(boolean legacy, Closure<Publisher<MutableHttpResponse<?>>> closure) {

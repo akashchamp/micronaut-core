@@ -71,6 +71,7 @@ import java.util.function.Predicate;
  * @param returnHandler       The return handler
  * @param isConditional       Is conditional filter
  * @param executor            The executor to run this filter on
+ * @param isReactive          Is the filter method reactive, either by its return type or its continuation
  * @author Jonas Konrad
  * @author Denis Stepanov
  * @since 4.2.0
@@ -92,7 +93,8 @@ record MethodFilter<T>(FilterOrder order,
                        boolean filtersException,
                        FilterReturnHandler returnHandler,
                        boolean isConditional,
-                       @Nullable Executor executor) implements InternalHttpFilter {
+                       @Nullable Executor executor,
+                       boolean isReactive) implements InternalHttpFilter {
 
     private static final Predicate<FilterMethodContext> FILTER_CONDITION_ALWAYS_TRUE = runner -> true;
 
@@ -122,6 +124,7 @@ record MethodFilter<T>(FilterOrder order,
         boolean skipOnError = isResponseFilter;
         boolean filtersException = false;
         ContinuationCreator continuationCreator = null;
+        boolean reactiveContinuation = false;
         for (int i = 0; i < arguments.length; i++) {
             Argument<?> argument = arguments[i];
             Class<?> argumentType = argument.getType();
@@ -168,12 +171,20 @@ record MethodFilter<T>(FilterOrder order,
                     throw new IllegalArgumentException("Only one continuation per filter is allowed");
                 }
                 Argument<?> continuationReturnType = argument.getFirstTypeVariable().orElseThrow(() -> new IllegalArgumentException("Continuations must specify generic type"));
-                if (isReactive(continuationReturnType) && continuationReturnType.getWrappedType().isAssignableFrom(MutableHttpResponse.class)) {
+                if (isExecutionFlow(continuationReturnType) && continuationReturnType.getWrappedType().isAssignableFrom(MutableHttpResponse.class)) {
+                    if (isExecutionFlow(returnType)) {
+                        continuationCreator = ResultAwareExecutionFlowContinuationImpl::new;
+                    } else {
+                        continuationCreator = ExecutionFlowContinuationImpl::new;
+                    }
+                    fulfilled[i] = ctx -> ctx.continuation;
+                } else if (isReactive(continuationReturnType) && continuationReturnType.getWrappedType().isAssignableFrom(MutableHttpResponse.class)) {
                     if (isReactive(returnType)) {
                         continuationCreator = ResultAwareReactiveContinuationImpl::new;
                     } else {
                         continuationCreator = ReactiveContinuationImpl::new;
                     }
+                    reactiveContinuation = true;
                     fulfilled[i] = ctx -> ctx.continuation;
                 } else if (continuationReturnType.getType().isAssignableFrom(MutableHttpResponse.class)) {
                     continuationCreator = BlockingContinuationImpl::new;
@@ -233,7 +244,8 @@ record MethodFilter<T>(FilterOrder order,
             filtersException,
             returnHandler,
             bean instanceof ConditionalFilter,
-            executor
+            executor,
+            isReactive(returnType) || reactiveContinuation
         );
     }
 
@@ -254,6 +266,10 @@ record MethodFilter<T>(FilterOrder order,
     private static boolean isReactive(Argument<?> continuationReturnType) {
         // Argument.isReactive doesn't work in http-validation, this is a workaround
         return continuationReturnType.isReactive() || continuationReturnType.getType() == Publisher.class;
+    }
+
+    private static boolean isExecutionFlow(Argument<?> type) {
+        return ExecutionFlow.class.isAssignableFrom(type.getType());
     }
 
     @Override
@@ -363,7 +379,12 @@ record MethodFilter<T>(FilterOrder order,
                 return ExecutionFlow.just(filterContext);
             }
             if (asyncArgBinders != null) {
-                return bindArgsAsync(methodContext).flatMap(a -> filter(filterContext, methodContext, a, onExecutor));
+                ExecutionFlow<Object[]> argsFlow = bindArgsAsync(methodContext);
+                if (filterContext.reactive()) {
+                    // subscribe the downstream in the reactive chain to keep its Reactor context
+                    argsFlow = ReactiveExecutionFlow.fromFlow(argsFlow);
+                }
+                return argsFlow.flatMap(a -> filter(filterContext, methodContext, a, onExecutor));
             } else {
                 try {
                     args = bindArgsSync(methodContext);
@@ -374,6 +395,10 @@ record MethodFilter<T>(FilterOrder order,
         }
         if (!onExecutor && executor != null) {
             Object[] finalArgs = args;
+            if (isReactive || filterContext.reactive()) {
+                // a reactive flow keeps the Reactor context of the subscriber for the downstream filters and the route
+                return ReactiveExecutionFlow.async(executor, () -> filter(filterContext, methodContext, finalArgs, true));
+            }
             return ExecutionFlow.async(executor, () -> filter(filterContext, methodContext, finalArgs, true));
         }
         try {
@@ -474,7 +499,21 @@ record MethodFilter<T>(FilterOrder order,
                 }
             }
         }
-        if (isReactive(type)) {
+        if (isExecutionFlow(type)) {
+            var next = prepareReturnHandler(conversionService, type.getWrappedType(), isResponseFilter, hasContinuation, false);
+            FilterReturnHandler delayed = new DelayedFilterReturnHandler(isResponseFilter, next, nullable) {
+                @Override
+                protected ExecutionFlow<?> toFlow(FilterContext context, Object returnValue, @Nullable InternalFilterContinuation<?> continuation) {
+                    return (ExecutionFlow<?>) returnValue;
+                }
+            };
+            return (context, returnValue, continuation) -> {
+                if (returnValue != null && continuation instanceof ResultAwareContinuation resultAwareContinuation) {
+                    return resultAwareContinuation.processResult(returnValue);
+                }
+                return delayed.handle(context, returnValue, continuation);
+            };
+        } else if (isReactive(type)) {
             var next = prepareReturnHandler(conversionService, type.getWrappedType(), isResponseFilter, hasContinuation, false);
             return (context, returnValue, continuation) -> {
                 if (returnValue == null && !nullable) {
@@ -617,6 +656,8 @@ record MethodFilter<T>(FilterOrder order,
     }
 
     private abstract static class DelayedFilterReturnHandler implements FilterReturnHandler {
+        private static final Object NULL_VALUE = new Object();
+
         final boolean isResponseFilter;
         final FilterReturnHandler next;
         final boolean nullable;
@@ -625,6 +666,16 @@ record MethodFilter<T>(FilterOrder order,
             this.isResponseFilter = isResponseFilter;
             this.next = next;
             this.nullable = nullable;
+        }
+
+        private static ExecutionFlow<Object> withNullAsValue(ExecutionFlow<?> flow) {
+            if (flow instanceof ReactiveExecutionFlow<?> reactiveFlow) {
+                return ReactiveExecutionFlow.fromPublisher(
+                    Mono.<Object>from(reactiveFlow.toPublisher()).defaultIfEmpty(NULL_VALUE)
+                );
+            }
+            // the imperative map is applied to an empty value as well
+            return flow.map(v -> v == null ? NULL_VALUE : v);
         }
 
         @SuppressWarnings("java:S1452")
@@ -652,9 +703,10 @@ record MethodFilter<T>(FilterOrder order,
                     }
                     return next.handle(context, doneFlow.getValue(), continuation);
                 } else {
-                    return delayedFlow.flatMap(v -> {
+                    // flatMap skips an empty value, the next handler decides if it's permitted
+                    return withNullAsValue(delayedFlow).flatMap(v -> {
                         try {
-                            return next.handle(context, v, continuation);
+                            return next.handle(context, v == NULL_VALUE ? null : v, continuation);
                         } catch (Throwable e) {
                             return ExecutionFlow.error(e);
                         }
@@ -695,6 +747,78 @@ record MethodFilter<T>(FilterOrder order,
     }
 
     /**
+     * The execution flow continuation that processes the method return value.
+     */
+    private static final class ResultAwareExecutionFlowContinuationImpl extends ExecutionFlowContinuationImpl
+        implements ResultAwareContinuation<ExecutionFlow<HttpResponse<?>>> {
+
+        private ResultAwareExecutionFlowContinuationImpl(Function<FilterContext, ExecutionFlow<FilterContext>> downstream,
+                                                         FilterContext filterContext,
+                                                         MutablePropagatedContext mutablePropagatedContext) {
+            super(downstream, filterContext, mutablePropagatedContext);
+        }
+
+        @Override
+        public ExecutionFlow<FilterContext> processResult(ExecutionFlow<HttpResponse<?>> flow) {
+            return flow.map(httpResponse -> filterContext.withResponse(
+                Objects.requireNonNull(httpResponse, "Returned response must not be null")
+            ));
+        }
+    }
+
+    /**
+     * Continuation implementation that yields an {@link ExecutionFlow}. The downstream flow is
+     * returned as is, so a reactive downstream stays reactive and keeps the Reactor context.
+     */
+    private static sealed class ExecutionFlowContinuationImpl implements FilterContinuation<ExecutionFlow<HttpResponse<?>>>,
+        InternalFilterContinuation<ExecutionFlow<HttpResponse<?>>> {
+
+        protected FilterContext filterContext;
+        private final Function<FilterContext, ExecutionFlow<FilterContext>> downstream;
+        private final MutablePropagatedContext mutablePropagatedContext;
+
+        private ExecutionFlowContinuationImpl(Function<FilterContext, ExecutionFlow<FilterContext>> downstream,
+                                              FilterContext filterContext,
+                                              MutablePropagatedContext mutablePropagatedContext) {
+            this.downstream = downstream;
+            this.filterContext = filterContext;
+            this.mutablePropagatedContext = mutablePropagatedContext;
+        }
+
+        @Override
+        public FilterContinuation<ExecutionFlow<HttpResponse<?>>> request(HttpRequest<?> request) {
+            filterContext = filterContext.withRequest(request);
+            return this;
+        }
+
+        @Override
+        public ExecutionFlow<HttpResponse<?>> proceed() {
+            PropagatedContext propagatedContext = filterContext.propagatedContext();
+            PropagatedContext mutatedPropagatedContext = mutablePropagatedContext.getContext();
+            if (propagatedContext != mutatedPropagatedContext && mutatedPropagatedContext != null) {
+                filterContext = filterContext.withPropagatedContext(mutatedPropagatedContext);
+            } else {
+                filterContext = filterContext.withPropagatedContext(PropagatedContext.find().orElse(filterContext.propagatedContext()));
+            }
+            ExecutionFlow<FilterContext> downstreamFlow;
+            try {
+                downstreamFlow = downstream.apply(filterContext);
+            } catch (Throwable e) {
+                return ExecutionFlow.error(e);
+            }
+            return downstreamFlow.map(newFilterContext -> {
+                filterContext = newFilterContext;
+                return Objects.requireNonNull(newFilterContext.response(), "Http response is missing");
+            });
+        }
+
+        @Override
+        public FilterContext afterMethodContext() {
+            return filterContext;
+        }
+    }
+
+    /**
      * Continuation implementation that yields a reactive type.<br>
      * This class implements a bunch of interfaces that it would otherwise have to create lambdas
      * for.
@@ -728,6 +852,7 @@ record MethodFilter<T>(FilterOrder order,
             } else {
                 filterContext = filterContext.withPropagatedContext(PropagatedContext.find().orElse(filterContext.propagatedContext()));
             }
+            filterContext = filterContext.asReactive();
             return ReactiveExecutionFlow.fromFlow(
                 downstream.apply(filterContext).<HttpResponse<?>>map(newFilterContext -> {
                     filterContext = newFilterContext;
