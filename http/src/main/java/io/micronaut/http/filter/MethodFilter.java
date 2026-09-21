@@ -97,6 +97,7 @@ record MethodFilter<T>(FilterOrder order,
                        boolean isReactive) implements InternalHttpFilter {
 
     private static final Predicate<FilterMethodContext> FILTER_CONDITION_ALWAYS_TRUE = runner -> true;
+    private static final String RESPONSE_MISSING_MESSAGE = "Http response is missing";
 
     static <T> MethodFilter<T> prepareFilterMethod(ConversionService conversionService,
                                                    T bean,
@@ -803,12 +804,12 @@ record MethodFilter<T>(FilterOrder order,
             ExecutionFlow<FilterContext> downstreamFlow;
             try {
                 downstreamFlow = downstream.apply(filterContext);
-            } catch (Throwable e) {
+            } catch (Exception e) {
                 return ExecutionFlow.error(e);
             }
             return downstreamFlow.map(newFilterContext -> {
                 filterContext = newFilterContext;
-                return Objects.requireNonNull(newFilterContext.response(), "Http response is missing");
+                return Objects.requireNonNull(newFilterContext.response(), RESPONSE_MISSING_MESSAGE);
             });
         }
 
@@ -856,7 +857,7 @@ record MethodFilter<T>(FilterOrder order,
             return ReactiveExecutionFlow.fromFlow(
                 downstream.apply(filterContext).<HttpResponse<?>>map(newFilterContext -> {
                     filterContext = newFilterContext;
-                    return Objects.requireNonNull(newFilterContext.response(), "Http response is missing");
+                    return Objects.requireNonNull(newFilterContext.response(), RESPONSE_MISSING_MESSAGE);
                 })
             ).toPublisher();
         }
@@ -922,7 +923,7 @@ record MethodFilter<T>(FilterOrder order,
                     if (interrupted) {
                         Thread.currentThread().interrupt();
                     }
-                    return Objects.requireNonNull(filterContext.response(), "Http response is missing");
+                    return Objects.requireNonNull(filterContext.response(), RESPONSE_MISSING_MESSAGE);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     interrupted = true;
