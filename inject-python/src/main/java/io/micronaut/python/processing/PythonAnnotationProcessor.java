@@ -23,6 +23,8 @@ import io.micronaut.core.util.StringUtils;
 import io.micronaut.inject.ast.ClassElement;
 import io.micronaut.inject.processing.ProcessingException;
 import io.micronaut.python.processing.beans.PythonBeanDefinitionProcessor;
+import io.micronaut.python.processing.diagnostic.PythonDiagnostic;
+import io.micronaut.python.processing.diagnostic.PythonDiagnostics;
 import io.micronaut.python.processing.util.PythonAnnotationTypes;
 import io.micronaut.python.processing.util.PythonKeywords;
 import io.micronaut.python.processing.visitor.PythonTypeElementVisitorProcessor;
@@ -53,6 +55,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -389,12 +392,12 @@ public class PythonAnnotationProcessor extends AbstractInjectAnnotationProcessor
                 return;
             }
             processPythonSourceVisitors(transformedList, values);
-            transformedList.stream()
-                .flatMap(transformResult -> transformResult.validationErrors().stream())
-                .findFirst()
-                .ifPresent(message -> {
-                    throw new ProcessingException(originatingElement, message);
-                });
+            reportDiagnostics(
+                transformedList.stream().flatMap(transformResult -> transformResult.validationErrors().stream()).toList(),
+                transformedList,
+                element,
+                originatingElement
+            );
 
             // Then parse the transformed code
             String[] srcDirs = values.src();
@@ -409,6 +412,7 @@ public class PythonAnnotationProcessor extends AbstractInjectAnnotationProcessor
                 } catch (Exception e) {
                     throw new ProcessingException(originatingElement, "Error parsing transformed python code: " + (e.getMessage() != null ? e.getMessage() : e.toString()));
                 }
+                reportDiagnostics(environment.diagnostics(), transformedList, element, originatingElement);
             }
 
             String mainPy;
@@ -572,11 +576,12 @@ public class PythonAnnotationProcessor extends AbstractInjectAnnotationProcessor
         } catch (ProcessingException e) {
             String ls = System.lineSeparator();
             io.micronaut.inject.ast.Element el = e.getElement();
+            // the message is not a format string: a Python message may well contain a percent sign
             if (el != null) {
                 String description = el.getDescription(true);
-                error(e.getMessage() + ls + ls + " -> " + description + ls + ls);
+                error("%s", e.getMessage() + ls + ls + " -> " + description + ls + ls);
             } else {
-                error(e.getMessage());
+                error("%s", e.getMessage());
             }
         } catch (Exception e) {
             StringWriter sw = new StringWriter();
@@ -642,6 +647,38 @@ public class PythonAnnotationProcessor extends AbstractInjectAnnotationProcessor
             }
         }
         return element -> names.contains(element.getName());
+    }
+
+    /**
+     * Reports every problem found in the Python sources, rendered with its location and an excerpt of
+     * the source, and fails the processing when any of them is an error. Every problem is reported,
+     * not only the first one, so a build shows all of them at once.
+     */
+    private void reportDiagnostics(List<PythonDiagnostic> diagnostics,
+                                   List<PythonAstParser.TransformResult> transformedList,
+                                   TypeElement element,
+                                   ClassElement originatingElement) {
+        if (diagnostics.isEmpty()) {
+            return;
+        }
+        Map<String, CharSequence> sources = new HashMap<>();
+        for (PythonAstParser.TransformResult transformResult : transformedList) {
+            Source source = transformResult.originalSource();
+            sources.put(PythonAstParser.sourcePathOf(source), source.getCharacters());
+        }
+        int errors = 0;
+        for (PythonDiagnostic diagnostic : diagnostics) {
+            String rendered = PythonDiagnostics.render(diagnostic, sources::get);
+            if (diagnostic.isError()) {
+                errors++;
+                error(element, "%s", rendered);
+            } else {
+                warning(element, "%s", rendered);
+            }
+        }
+        if (errors > 0) {
+            throw new ProcessingException(originatingElement, "Python processing found " + errors + (errors == 1 ? " error" : " errors"));
+        }
     }
 
     private void processPythonSourceVisitors(List<PythonAstParser.TransformResult> transformedList,
