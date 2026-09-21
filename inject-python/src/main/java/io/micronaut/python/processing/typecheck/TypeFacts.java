@@ -312,7 +312,22 @@ public final class TypeFacts {
                 throwsChecked = true;
             }
         }
-        return new MethodSignature(parameterTypes, method.isVarArgs(), method.isStatic(), typeName(method.getReturnType()), throwsChecked);
+        return new MethodSignature(parameterTypes, method.isVarArgs(), method.isStatic(), typeName(method.getReturnType()), throwsChecked, typeArguments(method.getGenericReturnType()));
+    }
+
+    /**
+     * The names of the type arguments of a parameterized type, empty when any of them is a type
+     * variable or a wildcard the compiled code could not name.
+     */
+    private static List<String> typeArguments(ClassElement type) {
+        List<String> names = new ArrayList<>();
+        for (ClassElement argument : type.getTypeArguments().values()) {
+            if (argument.isTypeVariable() || argument.isGenericPlaceholder() || argument.isWildcard()) {
+                return List.of();
+            }
+            names.add(typeName(argument));
+        }
+        return names;
     }
 
     /**
@@ -434,11 +449,28 @@ public final class TypeFacts {
      * @param isStatic       Whether the method is static
      * @param returnType     The qualified name of the return type, {@code void} for none
      * @param throwsChecked  Whether the method declares a checked exception
+     * @param returnTypeArguments The qualified names of the type arguments of the return type, in
+     *                       declaration order; empty when the return type is not parameterized or
+     *                       an argument is a type variable
      */
-    public record MethodSignature(List<String> parameterTypes, boolean varargs, boolean isStatic, String returnType, boolean throwsChecked) {
+    public record MethodSignature(List<String> parameterTypes, boolean varargs, boolean isStatic, String returnType, boolean throwsChecked, List<String> returnTypeArguments) {
 
         public MethodSignature {
             parameterTypes = List.copyOf(parameterTypes);
+            returnTypeArguments = returnTypeArguments == null ? List.of() : List.copyOf(returnTypeArguments);
+        }
+
+        /**
+         * A signature without type arguments of the return type.
+         *
+         * @param parameterTypes The parameter types
+         * @param varargs        Whether the last parameter takes the remaining arguments
+         * @param isStatic       Whether the method is static
+         * @param returnType     The return type
+         * @param throwsChecked  Whether the method declares a checked exception
+         */
+        public MethodSignature(List<String> parameterTypes, boolean varargs, boolean isStatic, String returnType, boolean throwsChecked) {
+            this(parameterTypes, varargs, isStatic, returnType, throwsChecked, List.of());
         }
 
         /**

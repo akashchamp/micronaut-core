@@ -476,10 +476,12 @@ class Typed:
     an interface or an abstract class): a member the type lacks is not reported on it.
     """
 
-    def __init__(self, kind, name, open=False):
+    def __init__(self, kind, name, open=False, args=()):
         self.kind = kind
         self.name = name
         self.open = open
+        # the type arguments when known (a list[int] hint, a List<Order> return type): Typed or None each
+        self.args = tuple(args)
 
     def __repr__(self):
         return f"{self.kind}:{self.name}"
@@ -504,17 +506,18 @@ class Typed:
         return None
 
 
-def of_java_type(name):
+def of_java_type(name, args=()):
     """
     The type of a value of a Java type: a Python value for the types the runtime converts, unknown
     for Object, which is what an erased type variable (the value of a Map, the element of a List)
-    reads as and says nothing about the actual value.
+    reads as and says nothing about the actual value. The type arguments, when given, are the
+    qualified names of the arguments of a parameterized type.
     """
     if name in BUILTIN_JAVA_TYPES:
         return Typed(BUILTIN, BUILTIN_JAVA_TYPES[name])
     if name == "java.lang.Object" or name.endswith("[]") or name in STANDARD_TYPES:
         return None
-    return Typed(JAVA, name)
+    return Typed(JAVA, name, args=[of_java_type(argument) for argument in args])
 
 
 class Bindings:
@@ -564,8 +567,9 @@ class Bindings:
         name = type_ref.name()
         if name in ("typing.Optional", "Optional") and type_ref.typeArguments():
             return self.of_hint(type_ref.typeArguments()[0])
+        args = [self.of_hint(argument) for argument in (type_ref.typeArguments() or [])]
         if name in BUILTIN_HINTS:
-            return Typed(BUILTIN, BUILTIN_HINTS[name])
+            return Typed(BUILTIN, BUILTIN_HINTS[name], args=args)
         typed = self.of_name(name, instance=True)
         if typed is not None and typed.kind == JAVA:
             if typed.name in STANDARD_TYPES:
@@ -573,7 +577,8 @@ class Bindings:
             description = self.checker.facts.describe(typed.name)
             if description is not None and (description.anInterface() or description.isAbstract()):
                 # any implementation may be behind the hint, with members of its own
-                return Typed(JAVA, typed.name, open=True)
+                return Typed(JAVA, typed.name, open=True, args=args)
+            return Typed(JAVA, typed.name, args=args)
         return typed
 
     def of_name(self, name, instance=False):
@@ -675,9 +680,12 @@ class JavaReceiverRules:
             self.assignment(node)
             return
         if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            iterated = self.expression(node.iter)
             for name in _bound_names(node.target):
                 self.bindings.forget(name)
-            self.expression(node.iter)
+            element = self._element_type(node.iter, iterated)
+            if isinstance(node.target, ast.Name) and element is not None and not isinstance(node, ast.comprehension):
+                self.bindings.assign(node.target.id, element)
             for child in getattr(node, "body", []) + getattr(node, "orelse", []):
                 self.statement(child)
             return
@@ -692,8 +700,12 @@ class JavaReceiverRules:
             return
         if isinstance(node, (ast.Try, ast.TryStar)):
             for handler in node.handlers:
+                caught = self.expression(handler.type) if handler.type is not None else None
                 if handler.name:
-                    self.bindings.forget(handler.name)
+                    if caught is not None and caught.kind == JAVA_REF:
+                        self.bindings.assign(handler.name, Typed(JAVA, caught.name))
+                    else:
+                        self.bindings.forget(handler.name)
             for child in node.body + node.orelse + node.finalbody:
                 self.statement(child)
             for handler in node.handlers:
@@ -735,6 +747,18 @@ class JavaReceiverRules:
             else:
                 for name in _bound_names(target):
                     self.bindings.forget(name)
+
+    def _element_type(self, iterable_node, iterated):
+        """The type of the elements a for loop yields, when known: range() yields ints, a typed collection its element type, a map its keys, a str its characters."""
+        if isinstance(iterable_node, ast.Call) and isinstance(iterable_node.func, ast.Name) and iterable_node.func.id == "range" and self.bindings.lookup("range") is None:
+            return Typed(BUILTIN, "int")
+        if iterated is None or not iterated.args:
+            return Typed(BUILTIN, "str") if iterated is not None and iterated.kind == BUILTIN and iterated.name == "str" else None
+        if iterated.kind == BUILTIN and iterated.name in ("list", "set", "tuple", "dict"):
+            return iterated.args[0]
+        if iterated.kind == JAVA and (self.facts.isAssignable(iterated.name, "java.lang.Iterable") or self.facts.isAssignable(iterated.name, "java.util.Map")):
+            return iterated.args[0]
+        return None
 
     def _hint_type(self, annotation):
         if self.bindings.visitor is None:
@@ -1028,7 +1052,8 @@ class JavaReceiverRules:
             return Typed(BUILTIN, "none")
         if name.endswith("[]"):
             return None  # arrays reach Python as sequences; their members are not judged
-        return of_java_type(name)
+        args = list(signatures[0].returnTypeArguments()) if len(signatures) == 1 else []
+        return of_java_type(name, args)
 
     @staticmethod
     def _enum_methods(receiver):
