@@ -30,6 +30,7 @@ import io.micronaut.python.processing.PythonSourceVisitor;
 import io.micronaut.inject.visitor.VisitorContext;
 import io.micronaut.python.processing.PythonAnnotationProcessor;
 import io.micronaut.python.processing.PythonProcessingSession;
+import io.micronaut.python.processing.diagnostic.PythonDiagnostic;
 import io.micronaut.python.processing.diagnostic.PythonDiagnostics;
 import org.jspecify.annotations.NonNull;
 
@@ -100,6 +101,7 @@ final class PyronautJavaCompiler {
 
     private final JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
     private Consumer<ClassElement> classElementCallback;
+    private Consumer<PythonDiagnostic> pythonDiagnosticCallback;
     private boolean verboseErrors;
     private File errorDumpDirectory;
     private List<SourceSnapshot> sourceSnapshots = List.of();
@@ -118,6 +120,16 @@ final class PyronautJavaCompiler {
      */
     public void setClassElementCallback(Consumer<ClassElement> callback) {
         this.classElementCallback = callback;
+    }
+
+    /**
+     * Set the callback to be invoked for each problem found in the Python sources.
+     *
+     * @param callback The callback function
+     * @since 5.3.0
+     */
+    public void setPythonDiagnosticCallback(Consumer<PythonDiagnostic> callback) {
+        this.pythonDiagnosticCallback = callback;
     }
 
     /**
@@ -1045,6 +1057,9 @@ final class PyronautJavaCompiler {
         pythonProcessor.setProcessingSession(pythonProcessingSession);
         if (classElementCallback != null) {
             pythonProcessor.setClassElementCallback(classElementCallback);
+        }
+        if (pythonDiagnosticCallback != null) {
+            pythonProcessor.setDiagnosticCallback(pythonDiagnosticCallback);
         }
         // Enable testing mode to ensure proper cleanup of GraalVM contexts
         // This prevents memory leaks in test environments
