@@ -401,12 +401,8 @@ public class PythonAnnotationProcessor extends AbstractInjectAnnotationProcessor
             boolean hasSrcDirs = srcDirs != null && srcDirs.length != 0;
             if (hasSrcDirs) {
                 try {
-                    List<Source> sourceList = transformedList
-                        .stream()
-                        .map(PythonAstParser.TransformResult::transformedSource)
-                        .toList();
-                    environment = parser.parse(
-                        sourceList,
+                    environment = parser.parseTransformed(
+                        transformedList,
                         Arrays.asList(srcDirs),
                         javaVisitorContext
                     );
