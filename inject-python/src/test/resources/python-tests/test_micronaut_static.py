@@ -514,6 +514,10 @@ class Pricing:
     def charred(self, text: str) -> bool:
         return 1 in text
 
+    def counted(self, counts: dict[str, int], values: list[str]) -> int:
+        counts["added"] = len(values)
+        return counts["added"]
+
 
 pricing: Annotated[Pricing, Inject]
 
@@ -530,10 +534,6 @@ def peek(cart: Cart) -> str:
 
 def helper_only(n: int) -> int:
     return n
-
-    def counted(self, counts: dict[str, int], values: list[str]) -> int:
-        counts["added"] = len(values)
-        return counts["added"]
 '''
 
 
