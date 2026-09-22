@@ -25,6 +25,7 @@ import reactor.core.publisher.Mono
 import spock.lang.Specification
 
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionStage
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
@@ -1123,6 +1124,113 @@ class FilterRunnerSpec extends Specification {
     }
 
     static class TestContextElement implements PropagatedContextElement {
+    }
+
+    def 'resolved completion stage request is unwrapped without suspending'(Closure<CompletionStage<?>> stage) {
+        given:
+        def req1 = HttpRequest.GET("/req1")
+        def req2 = HttpRequest.GET("/req2")
+        HttpRequest<?> terminalRequest = null
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(CompletionStage, Argument.of(HttpRequest))) { req ->
+                    stage(req2)
+                }
+        ]
+        def runner = new FilterRunner(filters, (filteredRequest, propagatedContext) -> {
+            terminalRequest = filteredRequest
+            ExecutionFlow.just(HttpResponse.ok())
+        })
+
+        when:
+        def result = runner.run(req1).tryComplete()
+        then:
+        result != null
+        result.value.status() == HttpStatus.OK
+        terminalRequest == req2
+
+        where:
+        stage << [
+                { r -> CompletableFuture.completedFuture(r) },
+                { r -> CompletableFuture.completedStage(r) },
+                { r -> CompletableFuture.completedFuture("ignored").thenApply { r } }
+        ]
+    }
+
+    def 'resolved nullable completion stage proceeds without suspending'() {
+        given:
+        def events = []
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(CompletionStage, nullableArgument(HttpResponse))) { req ->
+                    events.add("before")
+                    CompletableFuture.completedFuture(null)
+                }
+        ]
+
+        when:
+        def result = filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/")).tryComplete()
+        then:
+        result != null
+        result.value.status() == HttpStatus.OK
+        events == ["before", "terminal"]
+    }
+
+    def 'resolved completion stage response is unwrapped without suspending'() {
+        given:
+        def resp1 = HttpResponse.ok("resp1")
+        def resp2 = HttpResponse.ok("resp2")
+        List<GenericHttpFilter> filters = [
+                after(ReturnType.of(CompletionStage, Argument.of(HttpResponse))) { HttpResponse<?> resp ->
+                    assert resp == resp1
+                    CompletableFuture.completedStage(resp2)
+                }
+        ]
+
+        when:
+        def result = filterRunner(filters, {
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/")).tryComplete()
+        then:
+        result != null
+        result.value == resp2
+    }
+
+    def 'resolved completion stage error is unwrapped without suspending'() {
+        given:
+        def testExc = new RuntimeException("Test exception")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(CompletionStage, Argument.of(HttpRequest))) { req ->
+                    CompletableFuture.failedStage(testExc)
+                }
+        ]
+
+        when:
+        def result = filterRunner(filters, {
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/")).tryComplete()
+        then:
+        result != null
+        result.error == testExc
+    }
+
+    def 'continuation completion stage from an imperative downstream is unwrapped without suspending'() {
+        given:
+        def resp1 = HttpResponse.ok("resp1")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(CompletionStage, Argument.of(HttpResponse)), [Argument.of(FilterContinuation, ExecutionFlow)]) { FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    continuation.proceed().toCompletableFuture()
+                }
+        ]
+
+        when:
+        def result = filterRunner(filters, {
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/")).tryComplete()
+        then:
+        result != null
+        result.value == resp1
     }
 
     private static Argument<?> nullableArgument(Class<?> type) {
