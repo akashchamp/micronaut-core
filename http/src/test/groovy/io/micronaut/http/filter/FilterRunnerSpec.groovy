@@ -1028,7 +1028,7 @@ class FilterRunnerSpec extends Specification {
         flowReturn << [false, true]
     }
 
-    def 'reactor context written around a continuation passes executor filters'(boolean flowContinuation) {
+    def 'reactor context written around a continuation passes executor filters'(boolean flowContinuation, String operator, Closure<?> compose) {
         given:
         def executor = Executors.newSingleThreadExecutor()
         def events = []
@@ -1037,7 +1037,7 @@ class FilterRunnerSpec extends Specification {
                 before(ReturnType.of(continuationType, Argument.of(HttpResponse)), [Argument.of(FilterContinuation, continuationType)]) { continuation ->
                     def publisher = Mono.defer {
                         def next = continuation.proceed()
-                        flowContinuation ? Mono.from(ReactiveExecutionFlow.toPublisher(next)) : Mono.from(next)
+                        flowContinuation ? Mono.from(ReactiveExecutionFlow.toPublisher(compose(next))) : Mono.from(next)
                     }.contextWrite { it.put('value', 'around') }
                     flowContinuation ? ReactiveExecutionFlow.fromPublisher(publisher) : publisher
                 },
@@ -1060,7 +1060,39 @@ class FilterRunnerSpec extends Specification {
         executor.shutdown()
 
         where:
-        flowContinuation << [false, true]
+        flowContinuation | operator        | compose
+        false            | 'none'          | { it }
+        true             | 'none'          | { it }
+        true             | 'map'           | { ExecutionFlow f -> f.map { it } }
+        true             | 'flatMap'       | { ExecutionFlow f -> f.flatMap { ExecutionFlow.just(it) } }
+        true             | 'onErrorResume' | { ExecutionFlow f -> f.onErrorResume { ExecutionFlow.error(it) } }
+        true             | 'then'          | { ExecutionFlow f -> f.then { ExecutionFlow.just(HttpResponse.ok()) } }
+        true             | 'chained'       | { ExecutionFlow f -> f.map { it }.putInContext('other', 'value').flatMap { ExecutionFlow.just(it) } }
+    }
+
+    def 'operators on a continuation flow call the downstream once'() {
+        given:
+        def calls = 0
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(FilterContinuation, ExecutionFlow)]) { FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    def next = continuation.proceed()
+                    def first = next.map { it }
+                    def second = next.map { it }
+                    assert calls == 0
+                    first.tryComplete()
+                    second.tryComplete()
+                    first
+                }
+        ]
+
+        when:
+        def result = await(filterRunner(filters, {
+            calls++
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET('/'))).value
+        then:
+        result.status() == HttpStatus.OK
+        calls == 1
     }
 
     def 'execution flow continuation calls the downstream without reactive code when used as a flow'() {
