@@ -49,6 +49,11 @@ class Calc:
     def factor(self) -> float:
         return self.rate * 2
 
+    def bagged(self, n: int) -> str:
+        bag = Bag(n)
+        bag.rename("sack" + str(n))
+        return str(bag.doubled() + bag.count + bag._secret()) + "|" + bag.label
+
     def chained(self, n: int) -> str:
         return str(self.helper(n) * 2 + self._hidden(n)) + "|" + str(self.factor * n) + "|" + self.label(n, "z")
 
@@ -233,12 +238,28 @@ class Pair:
 
     def has_partner(self) -> bool:
         return self.calc is not None
+
+class Bag:
+    label: str = "bag"
+
+    def __init__(self, count: int):
+        self.count = count
+
+    def doubled(self) -> int:
+        return self.count * 2
+
+    def _secret(self) -> int:
+        return 7
+
+    def rename(self, label: str) -> None:
+        self.label = label
 '''
 
     static final List<List> CASES = [
         ["total", 3, 2.5d], ["total", 50, 2.5d],
         ["label", 2, "pen"],
         ["chained", 3], ["chained", 0],
+        ["bagged", 3], ["bagged", -1],
         ["ratio", 1, 4], ["ratio", 1, 0],
         ["parity", 3], ["parity", 8],
         ["unicode", "\uD83D\uDE00ab"], ["unicode", "i\u00DF"],

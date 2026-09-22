@@ -14,7 +14,7 @@ import ast
 
 import java
 
-from micronaut_typecheck import BUILTIN, CALLABLE, JAVA, JAVA_REF, MODULE, PY, PY_REF, Typed
+from micronaut_typecheck import BUILTIN, CALLABLE, JAVA, JAVA_REF, MODULE, PY, PY_REF, UNKNOWN, Typed
 
 # names Java cannot declare: its keywords and literals, and the methods of Object
 JAVA_RESERVED_NAMES = frozenset((
@@ -38,6 +38,7 @@ Body, Local, Assign, PutSelf, If, Return, Eval = (_ir(n) for n in ("Body", "Loca
 While, ForRange, ForEach, Break, Continue, Throw, Try, Catch = (_ir(n) for n in ("While", "ForRange", "ForEach", "Break", "Continue", "Throw", "Try", "Catch"))
 Const, Param, LocalRef, SelfProperty = (_ir(n) for n in ("Const", "Param", "LocalRef", "SelfProperty"))
 InvokeJava, NewJava, StaticField, Field, InvokeSibling = (_ir(n) for n in ("InvokeJava", "NewJava", "StaticField", "Field", "InvokeSibling"))
+InvokePython, PythonMember = (_ir(n) for n in ("InvokePython", "PythonMember"))
 Binary, Unary, Compare, And, Or, Conditional, Truthy, StrJoin, Helper, Cast = (
     _ir(n) for n in ("Binary", "Unary", "Compare", "And", "Or", "Conditional", "Truthy", "StrJoin", "Helper", "Cast"))
 
@@ -944,6 +945,9 @@ class Lowering:
         if isinstance(node.value, ast.Name) and node.value.id == "self":
             self.bridge_calls += 1
             return SelfProperty(node.attr, self._self_property_type(node.attr, node), self._is_accessor(node.attr))
+        model = self._python_model_of(node.value)
+        if model is not None:
+            return self._python_attribute(model, self._expression(node.value), node)
         target = self.rules.targets.get(id(node))
         if target is not None and target[0] == "field":
             _, owner, name, field_type, static = target
@@ -1004,6 +1008,15 @@ class Lowering:
             builtin = self._builtin_call(function, node, [self._expression(argument) for argument in node.args])
             if builtin is not None:
                 return builtin
+        if target is None and isinstance(function, ast.Attribute) and not (isinstance(function.value, ast.Name) and function.value.id == "self"):
+            model = self._python_model_of(function.value)
+            if model is not None:
+                return self._python_receiver_call(model, function.value, function.attr, node)
+        if target is None and isinstance(function, (ast.Name, ast.Attribute)):
+            # the checker types the arguments of a construction, not the callee: the bindings know the class
+            callee = self.bindings.lookup(function.id) if isinstance(function, ast.Name) and function.id not in self.locals and function.id not in self.parameters else self._typed(function)
+            if callee is not None and callee.kind == PY_REF:
+                return self._python_construction(callee.name, node)
         if target is None and isinstance(function, ast.Attribute):
             receiver_typed = self._typed(function.value)
             if receiver_typed is not None:
@@ -1098,6 +1111,162 @@ class Lowering:
             call = InvokeSibling(name, [], [self._boxed(argument, node) for argument in lowered_arguments], return_type, "python")
         used = JAVA_NUMBERS.get(return_type, return_type)
         return Cast(call, used) if used != return_type else call
+
+    # ---------------------------------------------------------------- objects of the classes of the compilation
+
+    def _python_model_of(self, node):
+        """The class model of a value of a Python class of the compilation, from the checker's type or the lowering's, else None."""
+        classes = getattr(self.checker, "python_classes", None)
+        if classes is None:
+            return None
+        typed = self._typed(node)
+        if typed is not None:
+            return classes.of(typed.name) if typed.kind == PY else None
+        lowered = self._lowered_type(node)
+        return classes.by_qualified.get(lowered) if lowered is not None else None
+
+    def _generated_class(self, model, node):
+        """The name of the generated Java class of a Python class, refusing the classes that generate no ordinary one."""
+        class_def = model.class_def
+        if class_def.isEnum():
+            self._refuse("unsupported-expression", f"[{model.name}] is an enum; its members are constants", node)
+        for base in class_def.bases():
+            if base.name() in ("Protocol", "typing.Protocol"):
+                self._refuse("unsupported-expression", f"[{model.name}] is a protocol", node)
+        for decorator in class_def.decorators():
+            if decorator.annotationName().rsplit(".", 1)[-1] == "ContextPooled":
+                self._refuse("unsupported-expression", f"[{model.name}] is served by a context pool; its objects have no Java class of their own", node)
+        return model.qualified
+
+    def _declared_by_generated_class(self, model, name):
+        """
+        Whether the generated Java class of the model declares the member: the class's own, or
+        inherited through its first Python base, the only base a generated class extends. A member
+        of another base is reachable through the Python object only.
+        """
+        seen = set()
+        current = model
+        while current is not None and current.qualified not in seen:
+            seen.add(current.qualified)
+            if name in current.methods or name in current.properties or name in current.attributes or name in current.instance_attributes:
+                return True
+            bases = current.bases()
+            current = bases[0] if bases and isinstance(bases[0], type(model)) else None
+        return False
+
+    def _python_attribute(self, model, receiver, node):
+        """An attribute of an object of the compilation: the accessor its generated class declares, else the attribute of the Python object."""
+        owner = self._generated_class(model, node)
+        found = model.find(node.attr)
+        if found is None:
+            self._refuse("unknown-type", f"[{model.name}] has no attribute [{node.attr}]", node)
+        kind = found[0]
+        if kind == "attribute":
+            # a hinted class attribute is a bean property of the generated class, read by its accessor
+            hint = found[1].typeName()
+            typed = self.bindings.of_hint(hint)
+            stub_type = self._stub_type(typed, hint, node)
+            if self._declared_by_generated_class(model, node.attr):
+                getter = ("is" if stub_type == BOOLEAN else "get") + node.attr[:1].upper() + node.attr[1:]
+                self.java_calls += 1
+                read = InvokeJava(receiver, owner, getter, [], [], stub_type)
+            else:
+                self.bridge_calls += 1
+                read = PythonMember(receiver, node.attr, stub_type)
+        elif kind == "property":
+            getter = found[1].getter()
+            return_def = getter.returnType() if getter is not None else None
+            hint = return_def.typeAnnotation() if return_def is not None else None
+            if hint is None:
+                self._refuse("unknown-type", f"the property [{node.attr}] of [{model.name}] has no return hint", node)
+            stub_type = self._stub_type(self.bindings.of_hint(hint), hint, node)
+            self.bridge_calls += 1
+            read = PythonMember(receiver, node.attr, stub_type)
+        elif kind == "instance":
+            typed = model.instance_attribute_type(node.attr, self.bindings)
+            if typed is None:
+                self._refuse("unknown-type", f"the attribute [{node.attr}] of [{model.name}] has no hinted type", node)
+            stub_type = self._stub_type(typed, None, node)
+            self.bridge_calls += 1
+            read = PythonMember(receiver, node.attr, stub_type)
+        else:
+            self._refuse("unsupported-expression", f"reading [{node.attr}] of [{model.name}], which is not an attribute, has no static lowering", node)
+        used = JAVA_NUMBERS.get(stub_type, stub_type)
+        return Cast(read, used) if used != stub_type else read
+
+    def _python_receiver_call(self, model, receiver_node, name, node):
+        """
+        A call of a method of an object of the compilation. The generated class's Java method is
+        called when it declares one for the call (a public method with a hinted signature the call
+        fills exactly; the class's own or inherited, Java dispatch resolving an override); otherwise
+        the method of the Python object is invoked, as the Python code would.
+        """
+        owner = self._generated_class(model, node)
+        found = model.find(name)
+        if found is None:
+            self._refuse("unknown-type", f"[{model.name}] has no method [{name}]", node)
+        if found[0] != "method":
+            self._refuse("unsupported-expression", f"calling [{name}] of [{model.name}], which is not a method, has no static lowering", node)
+        function_def, function_node = found[1], found[2]
+        if function_node is None or function_def.isAsync() or function_def.isGenerator():
+            self._refuse("unsupported-expression", f"calling the async or generator method [{name}] of [{model.name}] has no static lowering", node)
+        static = function_def.isStatic() or _decorated_with(function_node, ("staticmethod", "classmethod"))
+        return_def = function_def.returnType()
+        hint = return_def.typeAnnotation() if return_def is not None else None
+        if hint is None:
+            if function_def.hasReturnValue():
+                self._refuse("unknown-type", f"the method [{name}] of [{model.name}] returns a value but has no return hint", node)
+            return_type = VOID
+        elif hint.name() == "None":
+            return_type = VOID
+        else:
+            return_type = self._stub_type(self.bindings.of_hint(hint), hint, node)
+        lowered_arguments = [self._expression(argument) for argument in node.args]
+        parameters = [argument for argument in function_def.arguments().arguments() if argument.name() not in ("self", "cls")]
+        declares = (not name.startswith("_") and len(parameters) == len(lowered_arguments)
+                    and self._declared_by_generated_class(model, name)
+                    and all(argument.typeAnnotation() is not None and not argument.variadic() for argument in parameters)
+                    and function_node.args.vararg is None and not function_node.args.kwonlyargs and function_node.args.kwarg is None)
+        if declares:
+            parameter_types = [self._stub_type(self.bindings.of_hint(argument.typeAnnotation()), argument.typeAnnotation(), node) for argument in parameters]
+            arguments = [self._coerce(argument, parameter_type, argument_node)
+                         for argument, parameter_type, argument_node in zip(lowered_arguments, parameter_types, node.args)]
+            self.java_calls += 1
+            receiver = None if static else self._expression(receiver_node)
+            call = InvokeJava(receiver, owner, name, parameter_types, arguments, return_type)
+        else:
+            if static:
+                self._refuse("unsupported-expression", f"calling the static method [{name}] of [{model.name}] with this signature has no static lowering", node)
+            self.bridge_calls += 1
+            call = InvokePython(self._expression(receiver_node), name, [self._boxed(argument, node) for argument in lowered_arguments], return_type)
+        used = JAVA_NUMBERS.get(return_type, return_type)
+        return Cast(call, used) if used != return_type else call
+
+    def _python_construction(self, class_def, node):
+        """A construction of an object of the compilation: the generated class's constructor, which mirrors the hinted __init__."""
+        model = self.checker.python_classes.of(class_def)
+        owner = self._generated_class(model, node)
+        if node.keywords:
+            self._refuse("kwargs-to-java", "keyword arguments have no static lowering", node)
+        constructor = model.constructor_of()
+        if constructor is UNKNOWN:
+            self._refuse("unsupported-expression", f"the constructor of [{model.name}] is not the compilation's own", node)
+        lowered_arguments = [self._expression(argument) for argument in node.args]
+        if constructor is None:
+            if lowered_arguments:
+                self._refuse("unsupported-expression", f"[{model.name}] takes no constructor arguments", node)
+            self.java_calls += 1
+            return NewJava(owner, [], [])
+        function_def, function_node = constructor
+        parameters = [argument for argument in function_def.arguments().arguments() if argument.name() != "self"]
+        if (len(parameters) != len(lowered_arguments) or any(argument.typeAnnotation() is None or argument.variadic() for argument in parameters)
+                or (function_node is not None and (function_node.args.vararg is not None or function_node.args.kwonlyargs or function_node.args.kwarg is not None))):
+            self._refuse("unsupported-expression", f"constructing [{model.name}] with these arguments has no static lowering: the generated constructor takes every hinted parameter", node)
+        parameter_types = [self._stub_type(self.bindings.of_hint(argument.typeAnnotation()), argument.typeAnnotation(), node) for argument in parameters]
+        arguments = [self._coerce(argument, parameter_type, argument_node)
+                     for argument, parameter_type, argument_node in zip(lowered_arguments, parameter_types, node.args)]
+        self.java_calls += 1
+        return NewJava(owner, parameter_types, arguments)
 
     def _most_specific(self, matching, arguments, owner, name, node):
         """

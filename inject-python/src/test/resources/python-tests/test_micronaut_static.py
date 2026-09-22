@@ -297,10 +297,30 @@ from jakarta.inject import Singleton
 from java.lang import Exception, RuntimeException
 
 
+class Cart:
+    items: int = 0
+
+    def __init__(self, items: int, owner: str):
+        self.items = items
+        self.owner = owner
+
+    def total(self, n: int) -> int:
+        return self.items * n
+
+    def _hidden(self) -> int:
+        return 1
+
+
 @Singleton
 class Pricing:
     def __init__(self, rate: float):
         self.rate = rate
+
+    def carted(self, cart: Cart, n: int) -> int:
+        return cart.total(n) + cart.items + cart._hidden()
+
+    def built(self, n: int) -> str:
+        return Cart(n, "x").owner
 
     def total(self, quantity: int, unit_price: float) -> float:
         subtotal = quantity * unit_price
@@ -553,6 +573,26 @@ class LoweringTest(unittest.TestCase):
         branch = statements[1]
         self.assertEqual("result", list(branch.then().statements())[0].name())
         self.assertEqual("-", list(branch.orElse().statements())[0].value().op())
+
+    def test_objects_of_the_compilation_are_reached_through_their_generated_classes(self):
+        for name in ("carted", "built"):
+            self.assertEqual("COMPILED", self.decisions[f"Pricing.{name}"].outcome().name(), f"{name}: {[(r.rule(), r.message()) for r in self.decisions[f'Pricing.{name}'].reasons()]}")
+        carted = _uncast(list(self.bodies["carted"].body().statements())[0].value())
+        total = _uncast(carted.left().left())
+        self.assertEqual("InvokeJava", total.getClass().getSimpleName())
+        self.assertEqual("pkg.Cart", total.owner())
+        self.assertEqual("total", total.name())
+        self.assertEqual(["int"], list(total.parameterTypes()))
+        items = _uncast(carted.left().right())
+        self.assertEqual("getItems", items.name())  # a hinted class attribute: the accessor of the generated class
+        hidden = _uncast(carted.right())
+        self.assertEqual("InvokePython", hidden.getClass().getSimpleName())  # not bridged: through the Python object
+        self.assertEqual(2, self.bodies["carted"].stats().javaCalls())
+        self.assertEqual(1, self.bodies["carted"].stats().bridgeCalls())
+        built = _uncast(list(self.bodies["built"].body().statements())[0].value())
+        self.assertEqual("PythonMember", built.getClass().getSimpleName())  # an instance attribute: no accessor
+        self.assertEqual("NewJava", built.receiver().getClass().getSimpleName())
+        self.assertEqual(["int", "java.lang.String"], list(built.receiver().parameterTypes()))
 
     def test_sibling_calls_dispatch_to_the_stub_or_the_python_object(self):
         for name in ("sibling", "hidden_call", "via_property"):
