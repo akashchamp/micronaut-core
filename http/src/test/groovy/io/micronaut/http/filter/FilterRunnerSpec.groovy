@@ -3,10 +3,13 @@ package io.micronaut.http.filter
 import org.jspecify.annotations.Nullable
 import io.micronaut.core.annotation.AnnotationMetadata
 import io.micronaut.core.annotation.AnnotationUtil
+import io.micronaut.core.async.propagation.ReactorPropagation
 import io.micronaut.core.convert.ConversionService
 import io.micronaut.core.execution.CompletableFutureExecutionFlow
 import io.micronaut.core.execution.ExecutionFlow
 import io.micronaut.core.execution.ImperativeExecutionFlow
+import io.micronaut.core.propagation.PropagatedContext
+import io.micronaut.core.propagation.PropagatedContextElement
 import io.micronaut.core.type.Argument
 import io.micronaut.core.type.ReturnType
 import io.micronaut.http.HttpRequest
@@ -1000,6 +1003,94 @@ class FilterRunnerSpec extends Specification {
         then:
         def e = thrown NullPointerException
         e.message == "Returned request must not be null, or mark the method as @Nullable"
+    }
+
+    def 'reactive backed result keeps the propagated context'(boolean flowReturn) {
+        given:
+        def element = new TestContextElement()
+        def propagatedContext = PropagatedContext.empty().plus(element)
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(flowReturn ? ExecutionFlow : Publisher, Argument.of(HttpResponse))) { req ->
+                    def publisher = Mono.deferContextual { ctx ->
+                        assert ReactorPropagation.findContextElement(ctx, TestContextElement).orElse(null).is(element)
+                        Mono.just(HttpResponse.ok())
+                    }
+                    flowReturn ? ReactiveExecutionFlow.fromPublisher(publisher) : publisher
+                }
+        ]
+
+        expect:
+        await(filterRunner(filters, {
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/"), propagatedContext)).value.status() == HttpStatus.OK
+
+        where:
+        flowReturn << [false, true]
+    }
+
+    def 'reactor context written around a continuation passes executor filters'(boolean flowContinuation) {
+        given:
+        def executor = Executors.newSingleThreadExecutor()
+        def events = []
+        def continuationType = flowContinuation ? ExecutionFlow : Publisher
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(continuationType, Argument.of(HttpResponse)), [Argument.of(FilterContinuation, continuationType)]) { continuation ->
+                    def publisher = Mono.defer {
+                        def next = continuation.proceed()
+                        flowContinuation ? Mono.from(ReactiveExecutionFlow.toPublisher(next)) : Mono.from(next)
+                    }.contextWrite { it.put('value', 'around') }
+                    flowContinuation ? ReactiveExecutionFlow.fromPublisher(publisher) : publisher
+                },
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest)), [Argument.of(HttpRequest)], executor) { req ->
+                    ExecutionFlow.just(req)
+                }
+        ]
+
+        when:
+        await(filterRunner(filters, {
+            ReactiveExecutionFlow.fromPublisher(Mono.deferContextual { ctx ->
+                events.add(ctx.getOrDefault('value', 'missing'))
+                Mono.just(HttpResponse.ok())
+            })
+        }).run(HttpRequest.GET('/')))
+        then:
+        events == ['around']
+
+        cleanup:
+        executor.shutdown()
+
+        where:
+        flowContinuation << [false, true]
+    }
+
+    def 'execution flow continuation calls the downstream without reactive code when used as a flow'() {
+        given:
+        def executor = Executors.newSingleThreadExecutor()
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(FilterContinuation, ExecutionFlow)]) { FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    continuation.proceed().map { it }
+                },
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest)), [Argument.of(HttpRequest)], executor) { req ->
+                    assertNotReactive()
+                    ExecutionFlow.just(req)
+                }
+        ]
+
+        when:
+        def flow = filterRunner(filters, {
+            assertNotReactive()
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET('/'))
+        def result = await(flow).value
+        then:
+        !(flow instanceof ReactiveExecutionFlow)
+        result.status() == HttpStatus.OK
+
+        cleanup:
+        executor.shutdown()
+    }
+
+    static class TestContextElement implements PropagatedContextElement {
     }
 
     private static Argument<?> nullableArgument(Class<?> type) {

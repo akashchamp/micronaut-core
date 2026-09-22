@@ -39,6 +39,7 @@ import io.micronaut.http.MutableHttpResponse;
 import io.micronaut.http.ServerHttpRequest;
 import io.micronaut.http.bind.RequestBinderRegistry;
 import io.micronaut.http.reactive.execution.ReactiveExecutionFlow;
+import io.micronaut.http.reactive.execution.SubscriberAwareExecutionFlow;
 import io.micronaut.inject.ExecutableMethod;
 import org.jspecify.annotations.Nullable;
 import org.reactivestreams.Publisher;
@@ -509,6 +510,12 @@ record MethodFilter<T>(FilterOrder order,
                 }
             };
             return (context, returnValue, continuation) -> {
+                if (returnValue instanceof ReactiveExecutionFlow<?> reactiveFlow) {
+                    // the same propagation as a returned publisher
+                    returnValue = ReactiveExecutionFlow.fromPublisher(
+                        ReactivePropagation.propagate(context.propagatedContext(), reactiveFlow.toPublisher())
+                    );
+                }
                 if (returnValue != null && continuation instanceof ResultAwareContinuation resultAwareContinuation) {
                     return resultAwareContinuation.processResult(returnValue);
                 }
@@ -801,16 +808,25 @@ record MethodFilter<T>(FilterOrder order,
             } else {
                 filterContext = filterContext.withPropagatedContext(PropagatedContext.find().orElse(filterContext.propagatedContext()));
             }
-            ExecutionFlow<FilterContext> downstreamFlow;
-            try {
-                downstreamFlow = downstream.apply(filterContext);
-            } catch (Exception e) {
-                return ExecutionFlow.error(e);
-            }
-            return downstreamFlow.map(newFilterContext -> {
-                filterContext = newFilterContext;
-                return Objects.requireNonNull(newFilterContext.response(), RESPONSE_MISSING_MESSAGE);
-            });
+            // the downstream is called on the first use of the flow, reactively if it's converted to a publisher
+            return new SubscriberAwareExecutionFlow<>() {
+                @Override
+                protected ExecutionFlow<HttpResponse<?>> create(boolean reactive) {
+                    if (reactive) {
+                        filterContext = filterContext.asReactive();
+                    }
+                    ExecutionFlow<FilterContext> downstreamFlow;
+                    try {
+                        downstreamFlow = downstream.apply(filterContext);
+                    } catch (Exception e) {
+                        return ExecutionFlow.error(e);
+                    }
+                    return downstreamFlow.map(newFilterContext -> {
+                        filterContext = newFilterContext;
+                        return Objects.requireNonNull(newFilterContext.response(), RESPONSE_MISSING_MESSAGE);
+                    });
+                }
+            };
         }
 
         @Override
