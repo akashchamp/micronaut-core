@@ -21,8 +21,15 @@ import io.micronaut.core.annotation.UsedByGeneratedCode;
 import org.jspecify.annotations.Nullable;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -435,6 +442,347 @@ public final class PythonStatic {
      */
     public static boolean inRange(long value, long stop, long step) {
         return step > 0 ? value < stop : value > stop;
+    }
+
+    // ---------------------------------------------------------------- collections
+
+    /**
+     * @param elements The elements
+     * @param <T> The element type the caller expects
+     * @return A Python list: a mutable list of the elements
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> List<T> list(Object... elements) {
+        return (List<T>) new ArrayList<>(Arrays.asList(elements));
+    }
+
+    /**
+     * @param elements The elements
+     * @param <T> The element type the caller expects
+     * @return A Python tuple: an immutable list of the elements
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> List<T> tuple(Object... elements) {
+        return (List<T>) List.of(elements);
+    }
+
+    /**
+     * @param elements The elements, in order
+     * @param <T> The element type the caller expects
+     * @return A Python set: an insertion-ordered set of the elements
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> Set<T> set(Object... elements) {
+        return (Set<T>) new LinkedHashSet<>(Arrays.asList(elements));
+    }
+
+    /**
+     * @param keysAndValues The keys and values, alternating
+     * @param <K> The key type the caller expects
+     * @param <V> The value type the caller expects
+     * @return A Python dict: an insertion-ordered map
+     */
+    @SuppressWarnings("unchecked")
+    public static <K, V> Map<K, V> map(Object... keysAndValues) {
+        Map<Object, Object> map = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < keysAndValues.length; i += 2) {
+            map.put(keysAndValues[i], keysAndValues[i + 1]);
+        }
+        return (Map<K, V>) map;
+    }
+
+    /**
+     * @param list  A list
+     * @param index A Python index, negative from the end
+     * @return {@code list[index]}
+     * @throws IndexOutOfBoundsException When the index is out of range, as Python raises IndexError
+     */
+    public static Object at(List<?> list, long index) {
+        int size = list.size();
+        long position = index < 0 ? index + size : index;
+        if (position < 0 || position >= size) {
+            throw new IndexOutOfBoundsException("list index out of range");
+        }
+        return list.get((int) position);
+    }
+
+    /**
+     * @param text  A string
+     * @param index A Python index, negative from the end
+     * @return {@code text[index]}, a one-character string
+     * @throws IndexOutOfBoundsException When the index is out of range, as Python raises IndexError
+     */
+    public static String at(String text, long index) {
+        // Python indexes code points, Java's charAt UTF-16 units
+        int length = text.codePointCount(0, text.length());
+        long position = index < 0 ? index + length : index;
+        if (position < 0 || position >= length) {
+            throw new IndexOutOfBoundsException("string index out of range");
+        }
+        int offset = text.offsetByCodePoints(0, (int) position);
+        return text.substring(offset, text.offsetByCodePoints(offset, 1));
+    }
+
+    /**
+     * @param list  A list
+     * @param value The value
+     * @return {@code list.append(value)}: None, where the Java method answers a boolean
+     */
+    @SuppressWarnings("unchecked")
+    public static @Nullable Object append(List<?> list, @Nullable Object value) {
+        ((List<Object>) list).add(value);
+        return null;
+    }
+
+    /**
+     * @param set   A set
+     * @param value The value
+     * @return {@code set.add(value)}: None, where the Java method answers a boolean
+     */
+    @SuppressWarnings("unchecked")
+    public static @Nullable Object add(Set<?> set, @Nullable Object value) {
+        ((Set<Object>) set).add(value);
+        return null;
+    }
+
+    /**
+     * @param list  A list
+     * @param index A Python index, negative from the end
+     * @param value The value
+     * @throws IndexOutOfBoundsException When the index is out of range, as Python raises IndexError
+     */
+    @SuppressWarnings("unchecked")
+    public static void setAt(List<?> list, long index, @Nullable Object value) {
+        int size = list.size();
+        long position = index < 0 ? index + size : index;
+        if (position < 0 || position >= size) {
+            throw new IndexOutOfBoundsException("list assignment index out of range");
+        }
+        ((List<Object>) list).set((int) position, value);
+    }
+
+    /**
+     * @param value A Java collection given to a parameter hinted as a Python list, set or dict
+     * @param <T>   The type of the collection
+     * @return A copy, as the bridge hands Python one: the caller's collection stays untouched, and
+     * an unmodifiable one can be added to
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> T copy(T value) {
+        if (value instanceof List<?> list) {
+            return (T) new ArrayList<>(list);
+        }
+        if (value instanceof Set<?> set) {
+            return (T) new LinkedHashSet<>(set);
+        }
+        if (value instanceof Map<?, ?> map) {
+            return (T) new LinkedHashMap<>(map);
+        }
+        return value;
+    }
+
+    /**
+     * @param map   A map
+     * @param key   A key
+     * @param value The value
+     */
+    @SuppressWarnings("unchecked")
+    public static void setItem(Map<?, ?> map, @Nullable Object key, @Nullable Object value) {
+        ((Map<Object, Object>) map).put(key, value);
+    }
+
+    /**
+     * @param map A map
+     * @param key A key
+     * @return {@code map[key]}
+     * @throws NoSuchElementException When the key is absent, as Python raises KeyError
+     */
+    public static Object item(Map<?, ?> map, @Nullable Object key) {
+        if (!map.containsKey(key)) {
+            throw new NoSuchElementException("KeyError: " + str(key));
+        }
+        return map.get(key);
+    }
+
+    /**
+     * @param map          A map
+     * @param key          A key
+     * @param defaultValue The value when the key is absent
+     * @return {@code map.get(key, default)}
+     */
+    public static @Nullable Object get(Map<?, ?> map, @Nullable Object key, @Nullable Object defaultValue) {
+        return map.containsKey(key) ? map.get(key) : defaultValue;
+    }
+
+    /**
+     * @param value A string, list, set, map or tuple
+     * @return {@code len(value)}
+     */
+    public static long len(@Nullable Object value) {
+        if (value instanceof CharSequence text) {
+            String string = text.toString();
+            return string.codePointCount(0, string.length());
+        }
+        if (value instanceof Collection<?> collection) {
+            return collection.size();
+        }
+        if (value instanceof Map<?, ?> map) {
+            return map.size();
+        }
+        if (value != null && value.getClass().isArray()) {
+            return java.lang.reflect.Array.getLength(value);
+        }
+        throw new ClassCastException("object of type " + (value == null ? "NoneType" : value.getClass().getSimpleName()) + " has no len()");
+    }
+
+    /**
+     * @param container A string, collection or map
+     * @param element   The element, a substring for a string, a key for a map
+     * @return {@code element in container}
+     */
+    public static boolean contains(@Nullable Object container, @Nullable Object element) {
+        if (container instanceof CharSequence text) {
+            return element != null && text.toString().contains(element.toString());
+        }
+        if (container instanceof Collection<?> collection) {
+            return collection.contains(element);
+        }
+        if (container instanceof Map<?, ?> map) {
+            return map.containsKey(element);
+        }
+        throw new ClassCastException("argument of type " + (container == null ? "NoneType" : container.getClass().getSimpleName()) + " is not iterable");
+    }
+
+    // ---------------------------------------------------------------- strings
+
+    /**
+     * @param text A string
+     * @return {@code text.strip()}: the string without leading and trailing whitespace
+     */
+    public static String strip(String text) {
+        return text.strip();
+    }
+
+    /**
+     * @param text A string
+     * @param <T> The element type the caller expects
+     * @return {@code text.split()}: the runs of non-whitespace, no empty strings
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> List<T> split(String text) {
+        List<Object> parts = new ArrayList<>();
+        for (String part : text.strip().split("\\s+")) {
+            if (!part.isEmpty()) {
+                parts.add(part);
+            }
+        }
+        return (List<T>) parts;
+    }
+
+    /**
+     * @param text      A string
+     * @param separator The separator, as a plain string
+     * @param <T> The element type the caller expects
+     * @return {@code text.split(separator)}: every occurrence separates, empty strings kept
+     * @throws IllegalArgumentException On an empty separator, as Python raises ValueError
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> List<T> split(String text, String separator) {
+        if (separator.isEmpty()) {
+            throw new IllegalArgumentException("empty separator");
+        }
+        List<Object> parts = new ArrayList<>();
+        int start = 0;
+        while (true) {
+            int next = text.indexOf(separator, start);
+            if (next < 0) {
+                parts.add(text.substring(start));
+                return (List<T>) parts;
+            }
+            parts.add(text.substring(start, next));
+            start = next + separator.length();
+        }
+    }
+
+    /**
+     * @param separator The separator
+     * @param parts     The strings
+     * @return {@code separator.join(parts)}
+     * @throws ClassCastException When a part is not a string, as Python raises TypeError
+     */
+    public static String join(String separator, Iterable<?> parts) {
+        StringBuilder out = new StringBuilder();
+        boolean first = true;
+        for (Object part : parts) {
+            if (!(part instanceof String)) {
+                throw new ClassCastException("sequence item is not a str: " + str(part));
+            }
+            if (!first) {
+                out.append(separator);
+            }
+            out.append((String) part);
+            first = false;
+        }
+        return out.toString();
+    }
+
+    // ---------------------------------------------------------------- numbers
+
+    /**
+     * @param value A Python value
+     * @return {@code int(value)}: a float truncates towards zero, a string is parsed
+     * @throws IllegalArgumentException When a string is not an integer, as Python raises ValueError
+     */
+    public static long toInt(@Nullable Object value) {
+        if (value instanceof Boolean bool) {
+            return bool ? 1 : 0;
+        }
+        if (value instanceof Double || value instanceof Float) {
+            double d = ((Number) value).doubleValue();
+            if (Double.isNaN(d) || Double.isInfinite(d)) {
+                throw new IllegalArgumentException("cannot convert float " + str(d) + " to integer");
+            }
+            return (long) d;
+        }
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof CharSequence text) {
+            try {
+                return Long.parseLong(text.toString().strip());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("invalid literal for int() with base 10: '" + text + "'", e);
+            }
+        }
+        throw new ClassCastException("int() argument must be a string or a number, not " + (value == null ? "NoneType" : value.getClass().getSimpleName()));
+    }
+
+    /**
+     * @param value A Python value
+     * @return {@code float(value)}
+     * @throws IllegalArgumentException When a string is not a float, as Python raises ValueError
+     */
+    public static double toFloat(@Nullable Object value) {
+        if (value instanceof Boolean bool) {
+            return bool ? 1.0 : 0.0;
+        }
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        if (value instanceof CharSequence text) {
+            String trimmed = text.toString().strip();
+            try {
+                return switch (trimmed.toLowerCase(java.util.Locale.ROOT)) {
+                    case "inf", "+inf", "infinity" -> Double.POSITIVE_INFINITY;
+                    case "-inf", "-infinity" -> Double.NEGATIVE_INFINITY;
+                    case "nan", "+nan", "-nan" -> Double.NaN;
+                    default -> Double.parseDouble(trimmed);
+                };
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("could not convert string to float: '" + text + "'", e);
+            }
+        }
+        throw new ClassCastException("float() argument must be a string or a number, not " + (value == null ? "NoneType" : value.getClass().getSimpleName()));
     }
 
     /**

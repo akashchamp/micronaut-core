@@ -26,7 +26,12 @@ class FakeFacts:
         return None
 
     def isAssignable(self, source, target):
-        return source == target
+        supertypes = {
+            "java.util.List": {"java.util.Collection", "java.lang.Iterable"},
+            "java.util.Set": {"java.util.Collection", "java.lang.Iterable"},
+            "java.util.Collection": {"java.lang.Iterable"},
+        }
+        return source == target or target in supertypes.get(source, ())
 
 
 def plan(source, mode, strict=False, path="module.py", facts=None):
@@ -330,7 +335,7 @@ class Pricing:
         return self.truncate(n)
 
     def builtin(self, name: str) -> int:
-        return len(name)
+        return round(len(name) / 2)
 
     def power(self, base: int, exponent: int) -> int:
         return base ** exponent
@@ -430,6 +435,51 @@ class Pricing:
             pass
         i = 2
         return i
+
+    def collected(self, names: list[str], limit: int) -> list[str]:
+        picked: list[str] = []
+        for name in names:
+            if len(picked) >= limit:
+                break
+            if name in picked or not name.strip():
+                continue
+            picked.append(name.upper())
+        return picked
+
+    def indexed(self, values: list[int], index: int) -> int:
+        first = values[0]
+        return first + values[index] + len(values)
+
+    def priced(self, prices: dict[str, float], name: str) -> float:
+        if name in prices:
+            return prices[name]
+        return prices.get("default", 0.0)
+
+    def parsed(self, text: str) -> int:
+        parts = text.split(",")
+        total = 0
+        for part in parts:
+            total += int(part)
+        return max(total, 0)
+
+    def mixed(self) -> list[int]:
+        return [1, "x"]
+
+    def maybe_missing(self, values: dict[str, int]) -> bool:
+        return values.get("x") is None
+
+    def appended(self, values: list[int]) -> bool:
+        return values.append(1) is None
+
+    def crossed(self, values: list[int]) -> bool:
+        return 1.0 in values
+
+    def charred(self, text: str) -> bool:
+        return 1 in text
+
+    def counted(self, counts: dict[str, int], values: list[str]) -> int:
+        counts["added"] = len(values)
+        return counts["added"]
 '''
 
 
@@ -510,6 +560,10 @@ class LoweringTest(unittest.TestCase):
             "raises_python": "python-exception",
             "shadowed": "python-exception",  # without Java facts the exception types are unknown; with them the order is refused
             "tried": "unsupported-statement",
+            "mixed": "unknown-type",
+            "maybe_missing": "python-builtin-not-lowered",
+            "crossed": "unsupported-expression",
+            "charred": "unsupported-expression",
         }
         for name, rule in expectations.items():
             decision = self.decisions[f"Pricing.{name}"]
@@ -547,6 +601,32 @@ class LoweringTest(unittest.TestCase):
         self.assertEqual("COMPILED", self.decisions["Pricing.guarded_by_java"].outcome().name())
         tried = list(self.bodies["guarded_by_java"].body().statements())[1]  # after the shadow of n
         self.assertIsNotNone(tried.finallyBody())
+
+    def test_collections_and_strings_lower_to_helpers(self):
+        for name in ("collected", "indexed", "priced", "parsed"):
+            self.assertEqual("COMPILED", self.decisions[f"Pricing.{name}"].outcome().name(), f"{name}: {[(r.rule(), r.message()) for r in self.decisions[f'Pricing.{name}'].reasons()]}")
+        collected = self.bodies["collected"]
+        self.assertEqual("java.util.List", collected.returnType())
+        statements = list(collected.body().statements())
+        self.assertEqual("names_", statements[0].name())  # the list parameter is worked on as a copy
+        self.assertEqual("copy", statements[0].value().name())
+        self.assertEqual("picked", statements[1].name())
+        self.assertEqual("list", statements[1].value().name())
+        indexed = list(self.bodies["indexed"].body().statements())  # [0] is the copy of the list parameter
+        self.assertEqual("long", indexed[1].type())
+        self.assertEqual("at", indexed[1].value().operand().name())
+        priced = list(self.bodies["priced"].body().statements())  # [0] is the copy of the dict parameter
+        self.assertEqual("contains", priced[1].test().name())
+        self.assertEqual("item", list(priced[1].then().statements())[0].value().operand().name())
+        parsed = list(self.bodies["parsed"].body().statements())
+        self.assertEqual("java.util.List<java.lang.String>", parsed[0].value().type())
+        self.assertEqual("max", parsed[-1].value().operand().name())
+        counted = list(self.bodies["counted"].body().statements())  # [0] and [1] copy the parameters
+        self.assertEqual("setItem", counted[2].expression().name())
+        appended = list(self.bodies["appended"].body().statements())[1].value()  # after the copy of the parameter
+        self.assertEqual("is None", appended.op())
+        self.assertEqual("append", appended.left().name())
+        self.assertEqual("none", appended.left().type())
 
     def test_assertions_raise_through_the_helper(self):
         guarded = self.bodies["guarded"]
