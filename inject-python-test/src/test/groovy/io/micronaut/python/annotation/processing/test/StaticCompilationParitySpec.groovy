@@ -39,6 +39,19 @@ class Calc:
     def label(self, count: int, name: str) -> str:
         return f"{count} x {name}: {count * 2.5}"
 
+    def helper(self, n: int) -> int:
+        return n + 1
+
+    def _hidden(self, n: int) -> int:
+        return n - 1
+
+    @property
+    def factor(self) -> float:
+        return self.rate * 2
+
+    def chained(self, n: int) -> str:
+        return str(self.helper(n) * 2 + self._hidden(n)) + "|" + str(self.factor * n) + "|" + self.label(n, "z")
+
     def ratio(self, a: int, b: int) -> float:
         return a / b
 
@@ -225,6 +238,7 @@ class Pair:
     static final List<List> CASES = [
         ["total", 3, 2.5d], ["total", 50, 2.5d],
         ["label", 2, "pen"],
+        ["chained", 3], ["chained", 0],
         ["ratio", 1, 4], ["ratio", 1, 0],
         ["parity", 3], ["parity", 8],
         ["unicode", "\uD83D\uDE00ab"], ["unicode", "i\u00DF"],
