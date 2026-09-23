@@ -24,6 +24,7 @@ import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import spock.lang.Specification
 
+import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionStage
 import java.util.concurrent.ExecutionException
@@ -513,6 +514,121 @@ class FilterRunnerSpec extends Specification {
         events == ["terminal", "after"]
     }
 
+    def 'before returns an empty publisher'(Publisher<?> result) {
+        given:
+        def events = []
+        def resp1 = HttpResponse.ok("resp1")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(Publisher, Argument.of(HttpResponse))) { HttpRequest<?> req ->
+                    events.add("before")
+                    result
+                }
+        ]
+
+        when:
+        def resp = await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        resp == resp1
+        events == ["before", "terminal"]
+
+        where:
+        result << [Flux.empty(), Mono.empty(), Mono.delay(Duration.ofMillis(10)).then(Mono.empty())]
+    }
+
+    def 'after returns an empty publisher'(Publisher<?> result) {
+        given:
+        def events = []
+        def resp1 = HttpResponse.ok("resp1")
+        List<GenericHttpFilter> filters = [
+                after(ReturnType.of(Publisher, Argument.of(HttpResponse))) { HttpResponse<?> resp ->
+                    events.add("after")
+                    result
+                }
+        ]
+
+        when:
+        def resp = await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        resp == resp1
+        events == ["terminal", "after"]
+
+        where:
+        result << [Flux.empty(), Mono.empty(), Mono.delay(Duration.ofMillis(10)).then(Mono.empty())]
+    }
+
+    def 'around filter returns an empty publisher after proceeding'(boolean flux) {
+        given:
+        def events = []
+        def resp1 = HttpResponse.ok("resp1")
+        List<GenericHttpFilter> filters = [
+                around(false) { request, chain ->
+                    events.add("before")
+                    def downstream = Mono.from(chain.proceed(request)).doOnNext { events.add("after") }
+                    flux ? downstream.flux().then(Mono.empty()).flux() : downstream.then(Mono.empty())
+                }
+        ]
+
+        when:
+        def resp = await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        resp == resp1
+        events == ["before", "terminal", "after"]
+
+        where:
+        flux << [false, true]
+    }
+
+    def 'before returns a null publisher from a non-nullable method'() {
+        given:
+        def events = []
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(Publisher, Argument.of(HttpResponse))) { HttpRequest<?> req ->
+                    events.add("before")
+                    null
+                }
+        ]
+
+        when:
+        await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/")))
+        then:
+        def e = thrown NullPointerException
+        e.message == "Returned publisher must not be null, or mark the method as @Nullable"
+        events == ["before"]
+    }
+
+    def 'after returns a null publisher from a non-nullable method'() {
+        given:
+        def events = []
+        List<GenericHttpFilter> filters = [
+                after(ReturnType.of(Publisher, Argument.of(HttpResponse))) { HttpResponse<?> resp ->
+                    events.add("after")
+                    null
+                }
+        ]
+
+        when:
+        await(filterRunner(filters, {
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/")))
+        then:
+        def e = thrown NullPointerException
+        e.message == "Returned publisher must not be null, or mark the method as @Nullable"
+        events == ["terminal", "after"]
+    }
+
     def 'after should not be called if there is an exception but it cannot handle exceptions'() {
         given:
         def events = []
@@ -986,12 +1102,12 @@ class FilterRunnerSpec extends Specification {
         ExecutionFlow     | { CompletableFuture f -> ReactiveExecutionFlow.fromPublisher(Mono.fromFuture(f)) }
     }
 
-    def 'before returns a non-nullable request that completes later with null'() {
+    def 'before returns a non-nullable completion stage that completes later with null'() {
         given:
         def future = new CompletableFuture<HttpRequest<?>>()
         List<GenericHttpFilter> filters = [
-                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest))) { req ->
-                    CompletableFutureExecutionFlow.just(future)
+                before(ReturnType.of(CompletableFuture, Argument.of(HttpRequest))) { req ->
+                    future
                 }
         ]
 
@@ -1004,6 +1120,72 @@ class FilterRunnerSpec extends Specification {
         then:
         def e = thrown NullPointerException
         e.message == "Returned request must not be null, or mark the method as @Nullable"
+    }
+
+    def 'an empty execution flow proceeds with the current request'(Closure<ExecutionFlow<?>> empty) {
+        given:
+        def events = []
+        def req1 = HttpRequest.GET("/req1")
+        HttpRequest<?> terminalRequest = null
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest))) { req ->
+                    events.add("before")
+                    empty()
+                }
+        ]
+        def runner = new FilterRunner(filters, (filteredRequest, propagatedContext) -> {
+            terminalRequest = filteredRequest
+            events.add("terminal")
+            ExecutionFlow.just(HttpResponse.ok())
+        })
+
+        when:
+        def result = await(runner.run(req1)).value
+        then:
+        result.status() == HttpStatus.OK
+        terminalRequest == req1
+        events == ["before", "terminal"]
+
+        where:
+        empty << [
+                { ExecutionFlow.empty() },
+                { CompletableFutureExecutionFlow.just(CompletableFuture.completedFuture(null)) },
+                { ReactiveExecutionFlow.fromPublisher(Mono.empty()) }
+        ]
+    }
+
+    def 'an empty execution flow from a continuation proceeds with the downstream response'() {
+        given:
+        def resp1 = HttpResponse.ok("resp1")
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpResponse)), [Argument.of(FilterContinuation, ExecutionFlow)]) { FilterContinuation<ExecutionFlow<HttpResponse<?>>> continuation ->
+                    continuation.proceed().flatMap { ExecutionFlow.empty() }
+                }
+        ]
+
+        when:
+        def result = await(filterRunner(filters, {
+            ExecutionFlow.just(resp1)
+        }).run(HttpRequest.GET("/"))).value
+        then:
+        result == resp1
+    }
+
+    def 'a null execution flow fails when the method is not nullable'() {
+        given:
+        List<GenericHttpFilter> filters = [
+                before(ReturnType.of(ExecutionFlow, Argument.of(HttpRequest))) { req ->
+                    null
+                }
+        ]
+
+        when:
+        await(filterRunner(filters, {
+            ExecutionFlow.just(HttpResponse.ok())
+        }).run(HttpRequest.GET("/")))
+        then:
+        def e = thrown NullPointerException
+        e.message == "Returned flow must not be null, or mark the method as @Nullable"
     }
 
     def 'reactive backed result keeps the propagated context'(boolean flowReturn) {

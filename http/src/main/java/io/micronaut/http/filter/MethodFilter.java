@@ -43,6 +43,7 @@ import io.micronaut.http.reactive.execution.SubscriberAwareExecutionFlow;
 import io.micronaut.inject.ExecutableMethod;
 import org.jspecify.annotations.Nullable;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.NonBlocking;
 
@@ -99,6 +100,26 @@ record MethodFilter<T>(FilterOrder order,
 
     private static final Predicate<FilterMethodContext> FILTER_CONDITION_ALWAYS_TRUE = runner -> true;
     private static final String RESPONSE_MISSING_MESSAGE = "Http response is missing";
+    /**
+     * Marks an empty reactive result, which proceeds with the current context.
+     */
+    private static final Object EMPTY_RESULT = new Object();
+
+    /**
+     * Map an empty value to {@link #EMPTY_RESULT}, as the flow operators skip an empty value.
+     *
+     * @param flow The flow
+     * @return The flow with the empty value mapped
+     */
+    private static ExecutionFlow<Object> withEmptyResult(ExecutionFlow<?> flow) {
+        if (flow instanceof ReactiveExecutionFlow<?> reactiveFlow) {
+            return ReactiveExecutionFlow.fromPublisher(
+                Mono.<Object>from(reactiveFlow.toPublisher()).defaultIfEmpty(EMPTY_RESULT)
+            );
+        }
+        // the imperative map is applied to an empty value as well
+        return flow.map(v -> v == null ? EMPTY_RESULT : v);
+    }
 
     static <T> MethodFilter<T> prepareFilterMethod(ConversionService conversionService,
                                                    T bean,
@@ -503,29 +524,32 @@ record MethodFilter<T>(FilterOrder order,
         }
         if (isExecutionFlow(type)) {
             var next = prepareReturnHandler(conversionService, type.getWrappedType(), isResponseFilter, hasContinuation, false);
-            FilterReturnHandler delayed = new DelayedFilterReturnHandler(isResponseFilter, next, nullable) {
-                @Override
-                protected ExecutionFlow<?> toFlow(FilterContext context, Object returnValue, @Nullable InternalFilterContinuation<?> continuation) {
-                    return (ExecutionFlow<?>) returnValue;
-                }
-            };
             return (context, returnValue, continuation) -> {
-                if (returnValue instanceof ReactiveExecutionFlow<?> reactiveFlow) {
+                if (returnValue == null) {
+                    if (!nullable) {
+                        return ExecutionFlow.error(new NullPointerException("Returned flow must not be null, or mark the method as @Nullable"));
+                    }
+                    return ExecutionFlow.just(context);
+                }
+                ExecutionFlow<?> flow = (ExecutionFlow<?>) returnValue;
+                if (flow instanceof ReactiveExecutionFlow<?> reactiveFlow) {
                     // the same propagation as a returned publisher
-                    returnValue = ReactiveExecutionFlow.fromPublisher(
+                    flow = ReactiveExecutionFlow.fromPublisher(
                         ReactivePropagation.propagate(context.propagatedContext(), reactiveFlow.toPublisher())
                     );
                 }
-                if (returnValue != null && continuation instanceof ResultAwareContinuation resultAwareContinuation) {
-                    return resultAwareContinuation.processResult(returnValue);
+                if (continuation instanceof ResultAwareContinuation resultAwareContinuation) {
+                    return resultAwareContinuation.processResult(flow);
                 }
-                return delayed.handle(context, returnValue, continuation);
+                // flatMap skips an empty value, an empty flow proceeds with the current context
+                return withEmptyResult(flow)
+                    .flatMap(v -> v == EMPTY_RESULT ? ExecutionFlow.just(context) : next.handle(context, v, continuation));
             };
         } else if (isReactive(type)) {
             var next = prepareReturnHandler(conversionService, type.getWrappedType(), isResponseFilter, hasContinuation, false);
             return (context, returnValue, continuation) -> {
                 if (returnValue == null && !nullable) {
-                    return next.handle(context, null, continuation);
+                    return ExecutionFlow.error(new NullPointerException("Returned publisher must not be null, or mark the method as @Nullable"));
                 }
                 Publisher<Object> converted = Publishers.convertToPublisher(conversionService, returnValue == null ? Mono.empty() : returnValue);
                 if (continuation instanceof ResultAwareContinuation resultAwareContinuation) {
@@ -534,8 +558,10 @@ record MethodFilter<T>(FilterOrder order,
                         converted
                     ));
                 }
+                // flatMap skips an empty value, an empty publisher proceeds with the current context
                 return ReactiveExecutionFlow.fromPublisherEager(converted, context.propagatedContext())
-                    .flatMap(v -> next.handle(context, v, continuation));
+                    .map(v -> v == null ? EMPTY_RESULT : v)
+                    .flatMap(v -> v == EMPTY_RESULT ? ExecutionFlow.just(context) : next.handle(context, v, continuation));
             };
         } else if (type.isAsync()) {
             var next = prepareReturnHandler(conversionService, type.getWrappedType(), isResponseFilter, hasContinuation, false);
@@ -664,8 +690,6 @@ record MethodFilter<T>(FilterOrder order,
     }
 
     private abstract static class DelayedFilterReturnHandler implements FilterReturnHandler {
-        private static final Object NULL_VALUE = new Object();
-
         final boolean isResponseFilter;
         final FilterReturnHandler next;
         final boolean nullable;
@@ -674,16 +698,6 @@ record MethodFilter<T>(FilterOrder order,
             this.isResponseFilter = isResponseFilter;
             this.next = next;
             this.nullable = nullable;
-        }
-
-        private static ExecutionFlow<Object> withNullAsValue(ExecutionFlow<?> flow) {
-            if (flow instanceof ReactiveExecutionFlow<?> reactiveFlow) {
-                return ReactiveExecutionFlow.fromPublisher(
-                    Mono.<Object>from(reactiveFlow.toPublisher()).defaultIfEmpty(NULL_VALUE)
-                );
-            }
-            // the imperative map is applied to an empty value as well
-            return flow.map(v -> v == null ? NULL_VALUE : v);
         }
 
         @SuppressWarnings("java:S1452")
@@ -712,9 +726,9 @@ record MethodFilter<T>(FilterOrder order,
                     return next.handle(context, doneFlow.getValue(), continuation);
                 } else {
                     // flatMap skips an empty value, the next handler decides if it's permitted
-                    return withNullAsValue(delayedFlow).flatMap(v -> {
+                    return withEmptyResult(delayedFlow).flatMap(v -> {
                         try {
-                            return next.handle(context, v == NULL_VALUE ? null : v, continuation);
+                            return next.handle(context, v == EMPTY_RESULT ? null : v, continuation);
                         } catch (Throwable e) {
                             return ExecutionFlow.error(e);
                         }
@@ -750,7 +764,13 @@ record MethodFilter<T>(FilterOrder order,
 
         @Override
         public ExecutionFlow<FilterContext> processResult(Publisher<HttpResponse<?>> publisher) {
-            return ReactiveExecutionFlow.fromPublisher(publisher).map(httpResponse -> filterContext.withResponse(httpResponse));
+            // an empty publisher proceeds with the context after the continuation, the downstream response if it was called
+            Mono<HttpResponse<?>> mono = publisher instanceof Flux<HttpResponse<?>> flux ? flux.next() : Mono.from(publisher);
+            return ReactiveExecutionFlow.fromPublisher(
+                mono
+                    .map(httpResponse -> filterContext.withResponse(httpResponse))
+                    .switchIfEmpty(Mono.fromSupplier(() -> filterContext))
+            );
         }
     }
 
@@ -768,9 +788,9 @@ record MethodFilter<T>(FilterOrder order,
 
         @Override
         public ExecutionFlow<FilterContext> processResult(ExecutionFlow<HttpResponse<?>> flow) {
-            return flow.map(httpResponse -> filterContext.withResponse(
-                Objects.requireNonNull(httpResponse, "Returned response must not be null")
-            ));
+            // an empty flow proceeds with the context after the continuation, the downstream response if it was called
+            return withEmptyResult(flow)
+                .map(httpResponse -> httpResponse == EMPTY_RESULT ? filterContext : filterContext.withResponse((HttpResponse<?>) httpResponse));
         }
     }
 
@@ -857,7 +877,9 @@ record MethodFilter<T>(FilterOrder order,
 
         @Override
         public FilterContinuation<Publisher<HttpResponse<?>>> request(HttpRequest<?> request) {
-            return new ReactiveContinuationImpl(downstream, filterContext.withRequest(request), mutablePropagatedContext);
+            // keep this continuation, the method result is processed with its context
+            filterContext = filterContext.withRequest(request);
+            return this;
         }
 
         @Override
